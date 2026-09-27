@@ -162,6 +162,7 @@ stop_one() {
 
 down() {
     stop_one wander "wander.py"
+    stop_one planview "planview.py"
     stop_one robotd "$STATE/"
     stop_one ether "$STATE/"
     stop_one body "body_server --port $PORT"
@@ -523,6 +524,7 @@ WHY
 
     scripts/duck-sim drive        walk it forward, then stop
     scripts/duck-sim pose         where it is vs where it thinks it is
+    scripts/duck-sim planview     top-down orthographic view in a browser
     scripts/duck-sim ctl health   or anything else robotctl does
     scripts/duck-sim ctl robot do roulade
     scripts/duck-sim log          what the daemon is saying
@@ -945,6 +947,48 @@ wander() {
     esac
 }
 
+# ── plan view ────────────────────────────────────────────────────────────────
+# `planview.py` (kept in the state directory, like wander.py) is a live
+# top-down ORTHOGRAPHIC view of the sim, served as an MJPEG stream for a
+# browser. It is a mirror, not a second sim: it polls the body server's public
+# `read` op, rebuilds the same scene's qpos from the reply, renders one frame
+# per poll. The simulator's loop is untouched. It must run under `mjpython`:
+# on macOS the offscreen renderer only produces correct output with a GL
+# sharegroup, and GL is thread-affine, so all rendering happens on the mirror
+# thread inside the process.
+planview() {
+    [ -f "$STATE/planview.py" ] || die "no planview client at $STATE/planview.py"
+    case "${1:-}" in
+        "")
+            [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+            if [ -f "$STATE/planview.pid" ]; then
+                pid="$(tr -dc '0-9' < "$STATE/planview.pid")"
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                    say "plan view is already up — http://localhost:8910/"
+                    return 0
+                fi
+            fi
+            PY_BIN=python3
+            if [ "$(uname -s)" = Darwin ] && [ -x "$RL/.venv/bin/mjpython" ]; then
+                PY_BIN="$RL/.venv/bin/mjpython"
+            elif [ -x "$RL/.venv/bin/python" ]; then
+                PY_BIN="$RL/.venv/bin/python"
+            fi
+            say "plan view at http://localhost:8910/ — orthographic top-down, +x right +y up"
+            say "stop with: scripts/duck-sim planview stop"
+            $SETSID nohup "$PY_BIN" "$STATE/planview.py" > "$STATE/planview.log" 2>&1 &
+            echo $! > "$STATE/planview.pid"
+            ;;
+        stop)
+            stop_one planview "planview.py"
+            say "plan view stopped"
+            ;;
+        *)
+            die "planview takes no argument or 'stop'"
+            ;;
+    esac
+}
+
 # How fast the world is actually running. The daemons' loops are wall-clock, so a simulator below
 # real time is not merely slow to watch — the policies are driving robots that move less than they
 # expect, and they cannot balance one. Reported rather than left to be felt.
@@ -1322,6 +1366,7 @@ case "${1:-up}" in
     home)    shift; home "$@" ;;
     pose)    shift; pose "$@" ;;
     wander)  shift; wander "$@" ;;
+    planview) shift; planview "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
@@ -1329,5 +1374,5 @@ case "${1:-up}" in
     log)     tail -f "$STATE/robotd.log" ;;
     simlog)  tail -f "$STATE/body.log" ;;
     realtime) realtime ;;
-    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, home, pose, wander, monitor, ctl, log, simlog, status, realtime" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, home, pose, planview, wander, monitor, ctl, log, simlog, status, realtime" ;;
 esac
