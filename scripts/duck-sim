@@ -522,6 +522,7 @@ WHY
   Your duck is up. From here:
 
     scripts/duck-sim drive        walk it forward, then stop
+    scripts/duck-sim pose         where it is vs where it thinks it is
     scripts/duck-sim ctl health   or anything else robotctl does
     scripts/duck-sim ctl robot do roulade
     scripts/duck-sim log          what the daemon is saying
@@ -754,11 +755,11 @@ PY
 # first time this was tried.
 home() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
-    say "walking home — steering while walking, at most 12 legs"
+    say "walking home — measured primitives only, at most 36 legs"
     python3 - "$SOCK" "$PORT" <<'PY'
 import json, math, socket, sys, time
 sock_path, port = sys.argv[1], int(sys.argv[2])
-SPEED, WALK_LEG, ARRIVE, MAX_LEGS = 0.30, 5.0, 0.18, 12
+ARRIVE, MAX_LEGS = 0.18, 36
 
 b = socket.socket(); b.settimeout(5); b.connect(("127.0.0.1", port))
 bf = b.makefile("rw")
@@ -794,40 +795,121 @@ def walk(vx, steer, secs):
 
 time.sleep(1.0)
 
-# Calibration: steer one way while walking and watch the yaw. The sign of the
-# response varies with gait state, so measure, don't assume. Retried once.
-steer_sign = 0.0
-for attempt in range(2):
-    _, _, _, yaw0 = pose()
-    walk(0.25, 0.6, 3.0)
-    _, _, _, yaw1 = pose()
-    d = wrap(yaw1 - yaw0)
-    print(f"home: steer calibration try {attempt}: yaw moved {d * 57.3:+.0f} deg", flush=True)
-    if abs(d) > math.radians(8):
-        steer_sign = 1.0 if d > 0 else -1.0
-        break
-if steer_sign == 0.0:
-    steer_sign = 1.0
-    print("home: steer response unclear — assuming positive", flush=True)
-
+# Controller built only on measured, repeatable primitives of the published
+# velstand (2026-09-27, clean notifications):
+#   (0.30, 0.0)  forward ~0.11 m/s; heading drifts CW ~8 deg/s — free CW
+#                correction while walking
+#   (0.28,+0.55) heading HOLDS (drift ~0 over 5 s), walks forward+left — the
+#                reliable way to move toward anything left of the nose
+#   (0.10,-0.55) spin mode, ~15-25 deg/s, direction inconsistent — used only
+#                to break locks, with per-leg feedback
+# There is no reliable CW spin and no backward walk (both measured), so
+# right-side targets are aligned by the forward gait's CW drift; a stuck
+# detector spins the duck out of whichever limit cycle it is trapped in.
+last_dist, last_ae, stuck, spins = float("inf"), float("inf"), 0, 0
 for leg in range(MAX_LEGS):
     px, py, pz, yaw = pose()
     ex, ey = -px, -py
     dist = math.hypot(ex, ey)
     e = wrap(math.atan2(ey, ex) - yaw)
-    steer = clamp(1.2 * steer_sign * e, -0.8, 0.8)
-    print(f"home: leg {leg} pos=({px:+.2f},{py:+.2f}) dist={dist:.2f} yaw_err={e * 57.3:+.0f} deg steer={steer:+.2f}", flush=True)
+    ae = abs(math.degrees(e))
+    print(f"home: leg {leg} pos=({px:+.2f},{py:+.2f}) dist={dist:.2f} yaw_err={math.degrees(e):+.0f} deg", flush=True)
     if dist < ARRIVE:
         print(f"home: arrived, {dist:.2f} m from the origin", flush=True)
         break
     if pz < 0.09:
         print("home: the duck went down — letting the policy recover; try again", flush=True)
         break
-    walk(SPEED, steer, WALK_LEG)
+    if dist < last_dist - 0.03 or ae < last_ae - 8.0:
+        stuck = 0
+    else:
+        stuck += 1
+    last_dist, last_ae = dist, ae
+    if stuck >= 2:
+        spins += 1
+        if spins > 8:
+            print("home: the policy will not cooperate — giving up; try again", flush=True)
+            break
+        print("home: stuck in a gait lock — spinning to break it", flush=True)
+        walk(0.10, -0.55, 4.0)
+        stuck = 0
+        continue
+    if dist < 0.6:
+        walk(0.30, 0.15, 1.3)
+    elif e > math.radians(60.0):
+        # Far left: left-walk only points ~50 deg left of the nose, so a target
+        # deeper in the left quadrant needs rotation first.
+        walk(0.10, -0.55, 3.5)
+    elif e > math.radians(20.0):
+        walk(0.28, 0.55, 2.2)
+    elif e < math.radians(-25.0):
+        walk(0.30, 0.0, 2.5)
+    else:
+        walk(0.30, 0.10, 2.5)
 px, py, pz, _ = pose()
 print(f"home: final pos=({px:+.2f},{py:+.2f}) z={pz:.3f}", flush=True)
 PY
     say "stopped — the intent expires on its own"
+}
+
+# ── pose: where it is vs where it thinks it is ────────────────────────────
+# Two sources, side by side:
+#   actual  — the simulator's ground truth, read straight off the body server.
+#   odometry — the duck's OWN estimate: robotd's contact-based odometry, which
+#     anchors a sole corner to the world and follows it by forward kinematics,
+#     heading from the IMU (odometry/src/lib.rs). No GPS, no mocap — this is
+#     all the duck itself could ever know.
+# The odometry frame is "wherever it was looking at boot"; in the sim that is
+# the origin facing +x, the same as the world frame, so the two compare
+# directly. Walking accumulates odometry error — watch it grow with `drive`.
+pose() {
+    [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    python3 - "$SOCK" "$PORT" <<'PY'
+import json, math, socket, sys, time
+sock_path, port = sys.argv[1], int(sys.argv[2])
+
+def wrap(a):
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a < -math.pi:
+        a += 2 * math.pi
+    return a
+
+b = socket.socket(); b.settimeout(5); b.connect(("127.0.0.1", port))
+bf = b.makefile("rw")
+bf.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); bf.flush(); bf.readline()
+bf.write('{"op":"read"}\n'); bf.flush()
+r = json.loads(bf.readline())
+q = r["imu"]["quat"]; w, x, y, z = q
+yaw_true = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+px, py = r["trunk"][0], r["trunk"][1]
+
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sock_path)
+f = s.makefile("rw")
+f.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "robot.subscribe",
+                    "params": {"hz": 10}}) + "\n"); f.flush()
+f.readline()  # the ack names policies, not state
+state = None
+deadline = time.time() + 3.0
+while time.time() < deadline:
+    m = json.loads(f.readline())
+    if m.get("method") == "robot.state":
+        state = m["params"]
+        break
+if state is None:
+    print("pose: no robot.state on the stream"); sys.exit(1)
+
+odom = state["odom"]
+ox, oy = odom["position"][0], odom["position"][1]
+oyaw = odom["yaw"]
+fallen = state["safety"]["fallen"]
+
+err = math.hypot(ox - px, oy - py)
+yaw_err = wrap(oyaw - yaw_true)
+print(f"pose: actual    pos=({px:+.2f},{py:+.2f}) yaw={math.degrees(yaw_true):+.0f} deg", flush=True)
+print(f"pose: odometry  pos=({ox:+.2f},{oy:+.2f}) yaw={math.degrees(oyaw):+.0f} deg  (its own estimate)", flush=True)
+print(f"pose: error {err:.2f} m, {math.degrees(yaw_err):+.0f} deg (fallen={fallen})", flush=True)
+PY
 }
 
 # ── wandering ─────────────────────────────────────────────────────────────
@@ -1238,6 +1320,7 @@ case "${1:-up}" in
     down)    down_containers; down ;;
     drive)   shift; drive "$@" ;;
     home)    shift; home "$@" ;;
+    pose)    shift; pose "$@" ;;
     wander)  shift; wander "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
@@ -1246,5 +1329,5 @@ case "${1:-up}" in
     log)     tail -f "$STATE/robotd.log" ;;
     simlog)  tail -f "$STATE/body.log" ;;
     realtime) realtime ;;
-    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, home, wander, monitor, ctl, log, simlog, status, realtime" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, home, pose, wander, monitor, ctl, log, simlog, status, realtime" ;;
 esac
