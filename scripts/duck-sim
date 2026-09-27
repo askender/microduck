@@ -161,6 +161,7 @@ stop_one() {
 }
 
 down() {
+    stop_one wander "wander.py"
     stop_one robotd "$STATE/"
     stop_one ether "$STATE/"
     stop_one body "body_server --port $PORT"
@@ -239,8 +240,7 @@ up() {
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-walk = "$POLICIES/alpha_walking.onnx"
-stand = "$POLICIES/alpha_stand.onnx"
+walk = "$POLICIES/velstand.onnx"
 sitstand = "$POLICIES/alpha_sitstand.onnx"
 ground_pick = "$POLICIES/alpha_ground_pick.onnx"
 kick_left = "$POLICIES/ball_kick_left.onnx"
@@ -735,6 +735,134 @@ PY
     say "stopped — the intent expires on its own"
 }
 
+# ── homing ────────────────────────────────────────────────────────────────
+# Walk back to where the world started. Pose comes from the body server (the
+# robot has no odometry a client can read) and is recomputed every leg.
+#
+# Measured on the published Hub policy (2026-09-27), and what this controller
+# is built around:
+#   * It walks forward, and only forward — and the forward channel itself
+#     needs >= ~0.28 before a gait entrains at all.
+#   * The angular channel is dead: vyaw at the full trained turn-in-place
+#     range (+-0.8) turns nothing. Steering happens through the lateral
+#     channel instead: a lateral command shuffles the duck sideways and the
+#     shuffle drags the yaw with it (~45 deg per 4 s leg at 0.8). The sign
+#     of that coupling varies with gait state, so the first leg calibrates
+#     it by steering one way and watching which way the trunk yaw goes.
+#   * It yaws while it walks, so heading is closed per leg, not once.
+# Stops while still close: precision past ~0.15 m is how it fell over the
+# first time this was tried.
+home() {
+    [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    say "walking home — steering while walking, at most 12 legs"
+    python3 - "$SOCK" "$PORT" <<'PY'
+import json, math, socket, sys, time
+sock_path, port = sys.argv[1], int(sys.argv[2])
+SPEED, WALK_LEG, ARRIVE, MAX_LEGS = 0.30, 5.0, 0.18, 12
+
+b = socket.socket(); b.settimeout(5); b.connect(("127.0.0.1", port))
+bf = b.makefile("rw")
+bf.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); bf.flush(); bf.readline()
+
+def pose():
+    bf.write('{"op":"read"}\n'); bf.flush()
+    r = json.loads(bf.readline())
+    q = r["imu"]["quat"]; w, x, y, z = q
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return r["trunk"][0], r["trunk"][1], r["trunk"][2], yaw
+
+def wrap(a):
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a < -math.pi:
+        a += 2 * math.pi
+    return a
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sock_path)
+out = s.makefile("w")
+
+def walk(vx, steer, secs):
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        out.write(json.dumps({"jsonrpc": "2.0", "method": "robot.move",
+                              "params": {"vx": vx, "vy": steer, "vyaw": 0.0}}) + "\n")
+        out.flush()
+        time.sleep(0.1)
+
+time.sleep(1.0)
+
+# Calibration: steer one way while walking and watch the yaw. The sign of the
+# response varies with gait state, so measure, don't assume. Retried once.
+steer_sign = 0.0
+for attempt in range(2):
+    _, _, _, yaw0 = pose()
+    walk(0.25, 0.6, 3.0)
+    _, _, _, yaw1 = pose()
+    d = wrap(yaw1 - yaw0)
+    print(f"home: steer calibration try {attempt}: yaw moved {d * 57.3:+.0f} deg", flush=True)
+    if abs(d) > math.radians(8):
+        steer_sign = 1.0 if d > 0 else -1.0
+        break
+if steer_sign == 0.0:
+    steer_sign = 1.0
+    print("home: steer response unclear — assuming positive", flush=True)
+
+for leg in range(MAX_LEGS):
+    px, py, pz, yaw = pose()
+    ex, ey = -px, -py
+    dist = math.hypot(ex, ey)
+    e = wrap(math.atan2(ey, ex) - yaw)
+    steer = clamp(1.2 * steer_sign * e, -0.8, 0.8)
+    print(f"home: leg {leg} pos=({px:+.2f},{py:+.2f}) dist={dist:.2f} yaw_err={e * 57.3:+.0f} deg steer={steer:+.2f}", flush=True)
+    if dist < ARRIVE:
+        print(f"home: arrived, {dist:.2f} m from the origin", flush=True)
+        break
+    if pz < 0.09:
+        print("home: the duck went down — letting the policy recover; try again", flush=True)
+        break
+    walk(SPEED, steer, WALK_LEG)
+px, py, pz, _ = pose()
+print(f"home: final pos=({px:+.2f},{py:+.2f}) z={pz:.3f}", flush=True)
+PY
+    say "stopped — the intent expires on its own"
+}
+
+# ── wandering ─────────────────────────────────────────────────────────────
+# `wander.py` (kept in the state directory, not the repo) is the random-walk
+# client: a fresh random twist every few seconds, streamed as `robot.move`
+# intents at 10 Hz. It owns nothing — the deadman expires its intents 500 ms
+# after it exits, so stopping it parks the duck. Managed here so starting and
+# stopping are one word each and `down`/`up` cannot strand one running against
+# a daemon they just replaced.
+wander() {
+    [ -f "$STATE/wander.py" ] || die "no wander client at $STATE/wander.py"
+    case "${1:-}" in
+        "")
+            if [ -f "$STATE/wander.pid" ]; then
+                pid="$(tr -dc '0-9' < "$STATE/wander.pid")"
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                    say "already wandering (pid $pid)"
+                    return 0
+                fi
+            fi
+            say "wandering — a fresh direction every few seconds"
+            say "stop with: scripts/duck-sim wander stop"
+            $SETSID nohup python3 "$STATE/wander.py" > "$STATE/wander.log" 2>&1 &
+            echo $! > "$STATE/wander.pid"
+            ;;
+        stop)
+            stop_one wander "wander.py"
+            say "wander stopped — the intent expires and the duck stands"
+            ;;
+        *)
+            die "wander takes no argument or 'stop'"
+            ;;
+    esac
+}
+
 # How fast the world is actually running. The daemons' loops are wall-clock, so a simulator below
 # real time is not merely slow to watch — the policies are driving robots that move less than they
 # expect, and they cannot balance one. Reported rather than left to be felt.
@@ -1109,6 +1237,8 @@ case "${1:-up}" in
     shell)   shift; shell "$@" ;;
     down)    down_containers; down ;;
     drive)   shift; drive "$@" ;;
+    home)    shift; home "$@" ;;
+    wander)  shift; wander "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
@@ -1116,5 +1246,5 @@ case "${1:-up}" in
     log)     tail -f "$STATE/robotd.log" ;;
     simlog)  tail -f "$STATE/body.log" ;;
     realtime) realtime ;;
-    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, monitor, ctl, log, simlog, status, realtime" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, home, wander, monitor, ctl, log, simlog, status, realtime" ;;
 esac
