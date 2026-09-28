@@ -754,30 +754,23 @@ PY
 # Walk back to where the world started. Pose comes from the body server (the
 # robot has no odometry a client can read) and is recomputed every leg.
 #
-# Measured on the published Hub policy (2026-09-27), and what this controller
-# is built around:
-#   * It walks forward, and only forward — and the forward channel itself
-#     needs >= ~0.28 before a gait entrains at all.
-#   * The angular channel is dead: vyaw at the full trained turn-in-place
-#     range (+-0.8) turns nothing. Steering happens through the lateral
-#     channel instead: a lateral command shuffles the duck sideways and the
-#     shuffle drags the yaw with it (~45 deg per 4 s leg at 0.8). The sign
-#     of that coupling varies with gait state, so the first leg calibrates
-#     it by steering one way and watching which way the trunk yaw goes.
-#   * It yaws while it walks, so heading is closed per leg, not once.
-# Stops while still close: precision past ~0.15 m is how it fell over the
-# first time this was tried.
+# Rotate-then-walk, on primitives of the published velstand measured
+# 2026-09-28 (35-leg turn sweep, no falls):
+#   (0, ±2.0)  spin in place, both directions — ~45 deg/s averaged over a leg
+#              (steady 60; below |vyaw| ~1.5 the angular channel is dead,
+#              which is why an earlier controller steered by lateral shuffle)
+#   (0.3, ±2)  arcs down to R ≈ 0.1 m — steering while walking
+#   (1.2, 0)   the straight fast gait, ~0.68 m/s (drifts CW ~4 deg/s)
+#   (0.3, 0)   the dependable slow approach
+# Face the target, cover ground, steer the last metre; heading is closed
+# every leg because every gait drifts.
 home() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
     say "walking home — measured primitives only, at most 36 legs"
     python3 - "$SOCK" "$PORT" <<'PY'
-import json, math, os, socket, sys, time
+import json, math, socket, sys, time
 sock_path, port = sys.argv[1], int(sys.argv[2])
-ARRIVE, MAX_LEGS = 0.18, 36
-# Fast far legs are the default (primitives measured 2026-09-28 with a
-# clean-standing-start protocol, /tmp/vyaw0_sweep.py); DUCK_SIM_HOME_SLOW=1
-# restores the original all-slow controller.
-FAST = os.environ.get("DUCK_SIM_HOME_SLOW") != "1"
+ARRIVE, MAX_LEGS = 0.15, 36
 
 b = socket.socket(); b.settimeout(5); b.connect(("127.0.0.1", port))
 bf = b.makefile("rw")
@@ -803,33 +796,20 @@ def clamp(v, lo, hi):
 s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sock_path)
 out = s.makefile("w")
 
-def walk(vx, steer, secs):
+def walk(vx, vyaw, secs):
     t0 = time.time()
     while time.time() - t0 < secs:
         out.write(json.dumps({"jsonrpc": "2.0", "method": "robot.move",
-                              "params": {"vx": vx, "vy": steer, "vyaw": 0.0}}) + "\n")
+                              "params": {"vx": vx, "vy": 0.0, "vyaw": vyaw}}) + "\n")
         out.flush()
         time.sleep(0.1)
 
 time.sleep(1.0)
 
-# Controller built only on measured, repeatable primitives of the published
-# velstand (2026-09-27, clean notifications):
-#   (0.30, 0.0)  forward ~0.11 m/s; heading drifts CW ~8 deg/s — free CW
-#                correction while walking
-#   (0.28,+0.55) heading HOLDS (drift ~0 over 5 s), walks forward+left — the
-#                reliable way to move toward anything left of the nose
-#   (0.10,-0.55) spin mode, ~15-25 deg/s, direction inconsistent — used only
-#                to break locks, with per-leg feedback
-# 2026-09-28 speed sweep (vyaw=0, clean-standing start per leg) added two more:
-#   (1.2, 0.0)   ~0.68 m/s, near-STRAIGHT (CW drift ~4 deg/s) — the gait mode
-#                switches from curvy to straight around vx 1.1; good to 1.4,
-#                1.5 is the falling cliff
-#   (0.7, 0.0)   ~0.43 m/s with strong CW drift ~18 deg/s — the fast pursuit
-#                gait for right-side targets (the 0.3 gait only drifts 8 deg/s)
-# There is no reliable CW spin and no backward walk (both measured), so
-# right-side targets are aligned by the forward gait's CW drift; a stuck
-# detector spins the duck out of whichever limit cycle it is trapped in.
+# Per leg: face the target (spin, leaving ~8 deg to correct while walking),
+# then cover ground — the fast gait far, steered arc legs near. A stuck
+# detector spins out of gait locks, alternating direction now that both
+# spins work.
 last_dist, last_ae, stuck, spins = float("inf"), float("inf"), 0, 0
 for leg in range(MAX_LEGS):
     px, py, pz, yaw = pose()
@@ -855,37 +835,18 @@ for leg in range(MAX_LEGS):
             print("home: the policy will not cooperate — giving up; try again", flush=True)
             break
         print("home: stuck in a gait lock — spinning to break it", flush=True)
-        walk(0.10, -0.55, 4.0)
+        walk(0.0, 2.0 if spins % 2 else -2.0, 2.0)
         stuck = 0
         continue
-    if dist < 0.6:
-        # Near target, short legs only — a long leg here overshoots and the
-        # escape (dist going back up) costs more legs than the approach.
-        if ae > 60.0:
-            walk(0.10, -0.55, 1.5)
-        elif e > math.radians(20.0):
-            walk(0.28, 0.55, 1.2)
-        elif e < math.radians(-25.0):
-            walk(0.30, 0.0, 1.0)
-        else:
-            walk(0.30, 0.15, 1.0)
-    elif FAST and dist >= 1.2 and math.radians(-25.0) <= e <= math.radians(20.0):
-        # Far and roughly ahead: the straight fast gait covers ~1.4 m per leg
-        # (measured ~0.68 m/s). Its CW drift is only ~4 deg/s, so targets
-        # outside this band need the other gaits.
-        walk(1.2, 0.0, 2.0)
-    elif e > math.radians(60.0):
-        # Far left: left-walk only points ~50 deg left of the nose, so a target
-        # deeper in the left quadrant needs rotation first.
-        walk(0.10, -0.55, 3.5)
-    elif e > math.radians(20.0):
-        walk(0.28, 0.55, 2.2)
-    elif e < math.radians(-25.0):
-        # Right side: no reliable CW spin exists, so align by the forward
-        # gait's CW drift while walking — 0.7 drifts ~18 deg/s vs 0.3's 8.
-        walk(0.70, 0.0, 2.5) if FAST else walk(0.30, 0.0, 2.5)
+    if ae > 18.0:
+        # 45 deg/s is the leg-averaged spin rate at vyaw ±2, spin-up included.
+        walk(0.0, 2.0 if e > 0 else -2.0, clamp((ae - 8.0) / 45.0, 0.8, 3.5))
+    elif dist >= 1.2:
+        walk(1.2, 0.0, 2.0)                 # straight fast leg, ~1.4 m
+    elif dist >= 0.5:
+        walk(0.5, clamp(0.05 * math.degrees(e), -2.0, 2.0), 1.5)
     else:
-        walk(0.30, 0.10, 2.5)
+        walk(0.3, clamp(0.08 * math.degrees(e), -2.0, 2.0), 1.0)
 px, py, pz, _ = pose()
 print(f"home: final pos=({px:+.2f},{py:+.2f}) z={pz:.3f}", flush=True)
 PY
@@ -1014,7 +975,7 @@ planview() {
             fi
             say "plan view at http://localhost:8910/ — top-down in a browser; the pause button stops rendering to save CPU"
             say "stop with: scripts/duck-sim planview stop"
-            $SETSID nohup "$PY_BIN" "$STATE/planview.py" > "$STATE/planview.log" 2>&1 &
+            DUCK_SIM_REPO="$REPO" $SETSID nohup "$PY_BIN" "$STATE/planview.py" > "$STATE/planview.log" 2>&1 &
             echo $! > "$STATE/planview.pid"
             ;;
         stop)
