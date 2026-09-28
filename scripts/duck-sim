@@ -241,7 +241,10 @@ up() {
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-walk = "$POLICIES/velstand.onnx"
+# DUCK_SIM_WALK swaps the walking policy for one run of the sim (e.g. the
+# community running policy, policies/current/running.onnx); unset keeps the
+# published velstand. Every other policy is named explicitly too.
+walk = "${DUCK_SIM_WALK:-$POLICIES/velstand.onnx}"
 sitstand = "$POLICIES/alpha_sitstand.onnx"
 ground_pick = "$POLICIES/alpha_ground_pick.onnx"
 kick_left = "$POLICIES/ball_kick_left.onnx"
@@ -518,6 +521,14 @@ WHY
         i=$((i + 1))
     done
 
+    # DUCK_SIM_PLANVIEW=1 starts the browser plan view as part of `up`. The
+    # power-saving pairing is DUCK_SIM_VIEWER=0: the 3D window is the expensive
+    # render (~80% CPU), the headless body server is a few percent, and the
+    # plan view at 12 fps is the cheap way to watch the duck.
+    if [ "${DUCK_SIM_PLANVIEW:-0}" = "1" ]; then
+        planview
+    fi
+
     cat <<'NEXT'
 
   Your duck is up. From here:
@@ -525,6 +536,7 @@ WHY
     scripts/duck-sim drive        walk it forward, then stop
     scripts/duck-sim pose         where it is vs where it thinks it is
     scripts/duck-sim planview     top-down orthographic view in a browser
+                                  (auto-started when DUCK_SIM_PLANVIEW=1)
     scripts/duck-sim ctl health   or anything else robotctl does
     scripts/duck-sim ctl robot do roulade
     scripts/duck-sim log          what the daemon is saying
@@ -759,9 +771,13 @@ home() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
     say "walking home — measured primitives only, at most 36 legs"
     python3 - "$SOCK" "$PORT" <<'PY'
-import json, math, socket, sys, time
+import json, math, os, socket, sys, time
 sock_path, port = sys.argv[1], int(sys.argv[2])
 ARRIVE, MAX_LEGS = 0.18, 36
+# Fast far legs are the default (primitives measured 2026-09-28 with a
+# clean-standing-start protocol, /tmp/vyaw0_sweep.py); DUCK_SIM_HOME_SLOW=1
+# restores the original all-slow controller.
+FAST = os.environ.get("DUCK_SIM_HOME_SLOW") != "1"
 
 b = socket.socket(); b.settimeout(5); b.connect(("127.0.0.1", port))
 bf = b.makefile("rw")
@@ -805,6 +821,12 @@ time.sleep(1.0)
 #                reliable way to move toward anything left of the nose
 #   (0.10,-0.55) spin mode, ~15-25 deg/s, direction inconsistent — used only
 #                to break locks, with per-leg feedback
+# 2026-09-28 speed sweep (vyaw=0, clean-standing start per leg) added two more:
+#   (1.2, 0.0)   ~0.68 m/s, near-STRAIGHT (CW drift ~4 deg/s) — the gait mode
+#                switches from curvy to straight around vx 1.1; good to 1.4,
+#                1.5 is the falling cliff
+#   (0.7, 0.0)   ~0.43 m/s with strong CW drift ~18 deg/s — the fast pursuit
+#                gait for right-side targets (the 0.3 gait only drifts 8 deg/s)
 # There is no reliable CW spin and no backward walk (both measured), so
 # right-side targets are aligned by the forward gait's CW drift; a stuck
 # detector spins the duck out of whichever limit cycle it is trapped in.
@@ -837,7 +859,21 @@ for leg in range(MAX_LEGS):
         stuck = 0
         continue
     if dist < 0.6:
-        walk(0.30, 0.15, 1.3)
+        # Near target, short legs only — a long leg here overshoots and the
+        # escape (dist going back up) costs more legs than the approach.
+        if ae > 60.0:
+            walk(0.10, -0.55, 1.5)
+        elif e > math.radians(20.0):
+            walk(0.28, 0.55, 1.2)
+        elif e < math.radians(-25.0):
+            walk(0.30, 0.0, 1.0)
+        else:
+            walk(0.30, 0.15, 1.0)
+    elif FAST and dist >= 1.2 and math.radians(-25.0) <= e <= math.radians(20.0):
+        # Far and roughly ahead: the straight fast gait covers ~1.4 m per leg
+        # (measured ~0.68 m/s). Its CW drift is only ~4 deg/s, so targets
+        # outside this band need the other gaits.
+        walk(1.2, 0.0, 2.0)
     elif e > math.radians(60.0):
         # Far left: left-walk only points ~50 deg left of the nose, so a target
         # deeper in the left quadrant needs rotation first.
@@ -845,7 +881,9 @@ for leg in range(MAX_LEGS):
     elif e > math.radians(20.0):
         walk(0.28, 0.55, 2.2)
     elif e < math.radians(-25.0):
-        walk(0.30, 0.0, 2.5)
+        # Right side: no reliable CW spin exists, so align by the forward
+        # gait's CW drift while walking — 0.7 drifts ~18 deg/s vs 0.3's 8.
+        walk(0.70, 0.0, 2.5) if FAST else walk(0.30, 0.0, 2.5)
     else:
         walk(0.30, 0.10, 2.5)
 px, py, pz, _ = pose()
