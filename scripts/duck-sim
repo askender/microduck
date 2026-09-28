@@ -1012,7 +1012,7 @@ planview() {
             elif [ -x "$RL/.venv/bin/python" ]; then
                 PY_BIN="$RL/.venv/bin/python"
             fi
-            say "plan view at http://localhost:8910/ — orthographic top-down, +x right +y up"
+            say "plan view at http://localhost:8910/ — top-down in a browser; the pause button stops rendering to save CPU"
             say "stop with: scripts/duck-sim planview stop"
             $SETSID nohup "$PY_BIN" "$STATE/planview.py" > "$STATE/planview.log" 2>&1 &
             echo $! > "$STATE/planview.pid"
