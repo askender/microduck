@@ -42,6 +42,8 @@ The IMU is `id 200` and is read in the *same* `sync_read` as the servos, because
 the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip SFLP
 quaternion out of the same register block the servos answer at. One board, one code path, no
 IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
+The hardware inventory of both IMUs — chips, buses, fusion sites, defaults — is
+[`docs/robot/imus.md`](../robot/imus.md).
 
 **One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
