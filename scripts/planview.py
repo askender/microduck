@@ -45,8 +45,9 @@ and yawing. Q/E is a steering wheel: vyaw ramps up 0.25 per 100 ms while
 held (full lock ±2 in 0.8 s) and springs back four times faster on release.
 The slider sets the same vyaw directly and mirrors the wheel. Paused, the mirror
 thread idles and the last frame keeps being served — the picture freezes
-instead of going black, stamped PAUSED. That is the further power save: the
-12 fps GL render + JPEG encode is essentially all of this process's CPU.
+instead of going black, stamped PAUSED. Same when nobody is watching: the
+mirror renders only while a browser is actually connected to the stream, and
+that render + JPEG encode is essentially all of this process's CPU.
 
 Deliberately a client of the public `read` op rather than a patch to
 body_server: the simulator's loop is untouched, and the only cost is one
@@ -171,6 +172,7 @@ def init_gl() -> None:
 
 frame_lock = threading.Lock()
 latest_jpeg = None
+viewers = 0  # connected MJPEG clients; the mirror renders only for these
 
 # Camera modes. The default frame is pinned to the world origin; `?follow=1`
 # in the stream URL eases the camera's lookat onto the duck instead (and back
@@ -453,6 +455,12 @@ def run_mirror() -> None:
     print(f"planview: mirroring 127.0.0.1:{BODY_PORT}, scene {SCENE}", flush=True)
     n = 0
     while True:
+        if not viewers:
+            # Rendering is the cost; with nobody watching, idle at a low rate
+            # and keep serving the last frame. The body socket stays open —
+            # disconnect is detected when a viewer returns and a read runs.
+            time.sleep(0.5)
+            continue
         if paused:
             # Rendering is the cost; while paused, idle and keep serving the
             # last frame. The body socket stays open — disconnect is detected
@@ -691,7 +699,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"paused": paused, "fps": FPS, "frames": frame_count,
                         "follow": follow_duck, "pos": last_pose, "odom": odom,
                         "brain": brain, "brain_age": brain_age, "loop_hz": hz,
-                        "gate": self._gate(beat=False)})
+                        "gate": self._gate(beat=False), "viewers": viewers})
             return
         if self.path.startswith("/toggle"):
             paused = not paused
@@ -837,11 +845,13 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _stream(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-        self.end_headers()
-        boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        global viewers
+        viewers += 1
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
             while True:
                 with frame_lock:
                     jpeg = latest_jpeg
@@ -851,6 +861,8 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(1.0 / FPS)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+        finally:
+            viewers -= 1
 
     def log_message(self, *args):
         pass
