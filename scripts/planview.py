@@ -26,7 +26,7 @@ beside them, no scrolling.
 `/stream` is the MJPEG feed (the follow flag lives here); `/toggle` flips
 rendering on and off; `/status` reports state as JSON, including the duck's
 OWN pose estimate (a 2 Hz `robot.subscribe` thread) beside the ground truth
-so the drift is visible; `/ctl/follow|drive|sit|home|skill|health` are what
+so the drift is visible; `/ctl/follow|view|drive|sit|home|skill|health` are what
 the buttons press — `/ctl/skill?name=` runs a `robot.do` one-shot (roulade,
 kick_left, kick_right, ground_pick — whitelisted against the live skill
 list, probed once from a bogus name's refusal), and `/ctl/health` shells out
@@ -181,6 +181,10 @@ viewers = 0  # connected MJPEG clients; the mirror renders only for these
 follow_duck = False
 lookat_xy = [0.0, 0.0]
 FOLLOW_EASE = 0.15  # per frame at FPS — ~0.5 s time constant
+# Second locked view: the classic isometric (yaw 45°, pitch 35.264°), same
+# orthographic projection, rotation locked like the top view. follow_duck
+# still chooses what the lookat tracks.
+iso_view = False
 
 # Rendering on/off, global like the camera mode (one renderer, last viewer
 # wins). Paused: the mirror loop idles and the last JPEG keeps being served.
@@ -354,6 +358,12 @@ def render_frame(reading: dict) -> None:
     camera.lookat[0] = lookat_xy[0]
     camera.lookat[1] = lookat_xy[1]
 
+    # Both views are rotation-locked fixed poses; only the lookat eases.
+    # Elevation is negative-from-above in MuJoCo, so the 35.264° iso pitch
+    # (atan(1/√2)) is -35.264 here.
+    camera.azimuth, camera.elevation = (
+        (45.0, -35.264) if iso_view else (90.0, -90.0))
+
     renderer.update_scene(data, camera=camera)
     rgb = renderer.render()
     img = Image.fromarray(rgb)
@@ -508,6 +518,7 @@ PAGE = """<!doctype html>
 <aside>
   <button id="pause">…</button>
   <button id="follow">…</button>
+  <button id="view">切到：斜视</button>
   <button id="drive">前进 3 秒</button>
   <button id="sit">坐下 / 站起</button>
   <button id="brain">🧠 大脑 on</button>
@@ -536,8 +547,10 @@ async function refresh() {{
   catch (e) {{ $('st').textContent = 'server gone'; return; }}
   $('pause').textContent = r.paused ? '▶ 继续渲染' : '⏸ 暂停渲染';
   $('follow').textContent = r.follow ? '切到：定点' : '切到：跟随';
+  $('view').textContent = r.iso ? '切到：俯视' : '切到：斜视';
   let s = r.paused ? '已暂停（省 CPU）' : '渲染中 ' + r.fps + ' fps';
-  s += '\\n相机：' + (r.follow ? '跟随鸭子' : '原点固定');
+  s += '\\n相机：' + (r.follow ? '跟随鸭子' : '原点固定')
+       + ' · ' + (r.iso ? '斜视' : '俯视');
   if (r.pos) {{
     s += '\\n位置 (' + r.pos[0].toFixed(2) + ', ' + r.pos[1].toFixed(2) + ') m';
     s += '\\n朝向 ' + r.pos[2].toFixed(0) + '°';
@@ -568,6 +581,10 @@ $('pause').onclick = async () => {{ await fetch('/toggle'); refresh(); }};
 $('follow').onclick = async () => {{
   const on = $('follow').textContent.includes('跟随');
   await fetch('/ctl/follow?on=' + (on ? '1' : '0')); refresh();
+}};
+$('view').onclick = async () => {{
+  const iso = $('view').textContent.includes('斜视');
+  await fetch('/ctl/view?iso=' + (iso ? '1' : '0')); refresh();
 }};
 $('drive').onclick = async () => {{ await fetch('/ctl/drive'); }};
 $('sit').onclick = async () => {{ await fetch('/ctl/sit'); }};
@@ -690,14 +707,15 @@ def follow_from_path(path: str) -> bool:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global follow_duck, paused
+        global follow_duck, paused, iso_view
         if self.path.startswith("/status"):
             with odom_lock:
                 odom = list(odom_pose) if odom_pose is not None else None
                 brain, hz = brain_policy, loop_hz
                 brain_age = time.time() - state_ts if state_ts else None
             self._json({"paused": paused, "fps": FPS, "frames": frame_count,
-                        "follow": follow_duck, "pos": last_pose, "odom": odom,
+                        "follow": follow_duck, "iso": iso_view,
+                        "pos": last_pose, "odom": odom,
                         "brain": brain, "brain_age": brain_age, "loop_hz": hz,
                         "gate": self._gate(beat=False), "viewers": viewers})
             return
@@ -714,6 +732,12 @@ class Handler(BaseHTTPRequestHandler):
             follow_duck = on
             print(f"planview: camera follow {'on' if on else 'off'} (page button)", flush=True)
             self._json({"follow": follow_duck})
+            return
+        if self.path.startswith("/ctl/view"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            iso_view = q.get("iso", ["0"])[0] == "1"
+            print(f"planview: view {'isometric' if iso_view else 'top-down'} (page button)", flush=True)
+            self._json({"iso": iso_view})
             return
         if self.path.startswith("/ctl/drive"):
             threading.Thread(target=drive_leg, daemon=True).start()
