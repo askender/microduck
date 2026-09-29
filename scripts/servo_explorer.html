@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>舵机形态对照器</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #14161a; color: #ccd2da;
+               font: 13px/1.45 system-ui, sans-serif; }
+  body { display: flex; }
+  aside { width: 300px; min-width: 300px; padding: 12px; box-sizing: border-box;
+          border-right: 1px solid #2a2e36; overflow-y: auto; height: 100%; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: #8b93a0; font-size: 12px; margin-bottom: 10px; }
+  button, select { font: inherit; background: #232830; color: inherit;
+                   border: 1px solid #3a414c; border-radius: 5px; padding: 4px 10px; }
+  button { cursor: pointer; width: 100%; margin-bottom: 8px; }
+  select { width: 100%; margin-bottom: 10px; }
+  .row { margin-bottom: 7px; }
+  .row .lab { display: flex; justify-content: space-between; font-size: 12px;
+              font-family: ui-monospace, monospace; }
+  .row .val { font-weight: bold; }
+  .row input { width: 100%; margin: 2px 0 0; }
+  .row.mouth { color: #6b7280; font-size: 12px; border-top: 1px dashed #2a2e36;
+               border-bottom: 1px dashed #2a2e36; padding: 6px 0; margin: 8px 0; }
+  .legend { margin-top: 12px; font-size: 12px; color: #8b93a0; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+              margin: 0 4px 0 0; vertical-align: -1px; }
+  main { flex: 1; display: flex; align-items: stretch; justify-content: center; }
+  canvas { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>舵机形态对照器</h1>
+  <div class="sub">纯运动学：滑槽值直接当作关节角画出骨架，无物理、无仿真。
+  全部拉到 0 就是 INIT 位。数值即线序 positions[i]（rad）。</div>
+  <button id="zero">归零（INIT）</button>
+  <select id="preset"></select>
+  <div id="sliders"></div>
+  <div class="legend" id="legend"></div>
+  <div class="sub" style="margin-top:10px">三个视图均为正交投影：侧视（自 -Y 看）、
+  正视（自 +X 看，鸭脸朝你）、顶视（自上而下）。鸭子面朝 +X。虚线是最低点参照
+  （根部高度由 freejoint 决定，不随滑槽动，画面里鸭子始终踩在这条线上）。</div>
+</aside>
+<main><canvas id="cv"></canvas></main>
+<script src="servo_explorer_data.js"></script>
+<script>
+const D = window.SERVO_DATA;
+const N_DEG = 180 / Math.PI;
+
+// ---- FK-CORE-BEGIN (kept self-contained: scripts/fk_check extracts and tests it) ----
+function quat2mat(q) {
+  const [w, x, y, z] = q;
+  return [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+          2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+          2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)];
+}
+function matmul(a, b) {
+  const o = new Array(9);
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++)
+    o[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
+  return o;
+}
+function matvec(m, v) {
+  return [m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+          m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+          m[6] * v[0] + m[7] * v[1] + m[8] * v[2]];
+}
+function axisAngle(axis, angle) {
+  const [x, y, z] = axis, s = Math.sin(angle / 2), c = Math.cos(angle / 2);
+  return quat2mat([c, x * s, y * s, z * s]);
+}
+// Forward kinematics: angles maps joint name -> radians. Returns per body
+// world translation and rotation (row-major 3x3), like mujoco xpos/xmat.
+function fk(data, angles) {
+  const out = {};
+  for (const b of data.bodies) {
+    let t = b.pos.slice(), R = quat2mat(b.quat);
+    const parent = out[b.parent];
+    if (parent) {
+      t = parent.t.slice();
+      const off = matvec(parent.R, b.pos);
+      t[0] += off[0]; t[1] += off[1]; t[2] += off[2];
+      R = matmul(parent.R, R);
+    }
+    for (const j of b.joints) {
+      const a = angles[j.name] || 0;
+      if (!a) continue;
+      // mujoco right-multiplies (xquat ⊗ q_joint): the hinge axis lives in
+      // the child body's LOCAL frame
+      const Rnew = matmul(R, axisAngle(j.axis, a));
+      const anchor = matvec(R, j.pos), anchorNew = matvec(Rnew, j.pos);
+      t[0] += anchor[0] - anchorNew[0];
+      t[1] += anchor[1] - anchorNew[1];
+      t[2] += anchor[2] - anchorNew[2];
+      R = Rnew;
+    }
+    out[b.name] = { t, R };
+  }
+  return out;
+}
+// ---- FK-CORE-END ----
+
+function geomWorld(b, g) {
+  const w = FK[b.name], Rb = w.R, tb = w.t;
+  const R = matmul(Rb, quat2mat(g.quat));
+  const off = matvec(Rb, g.pos);
+  return { t: [tb[0] + off[0], tb[1] + off[1], tb[2] + off[2]], R };
+}
+
+function groupOf(bodyName) {
+  if (/left|_l\b|_l$/.test(bodyName)) return "left";
+  if (/right|_2$/.test(bodyName)) return "right";
+  if (/neck|head|jaw|yaw_roll/.test(bodyName)) return "head";
+  return "trunk";
+}
+const COLORS = { left: "#e69138", right: "#3d85c6", head: "#6aa84f", trunk: "#9aa0a8" };
+const CN_SIDE = { left: "左", right: "右", head: "头颈", trunk: "躯干" };
+
+const sliders = {};   // joint name -> input element
+const values = {};    // joint name -> radians
+
+function buildPanel() {
+  const box = document.getElementById("sliders");
+  for (let slot = 0; slot < D.joint_names.length; slot++) {
+    const name = D.joint_names[slot];
+    if (slot === D.mouth_slot) {
+      const note = document.createElement("div");
+      note.className = "row mouth";
+      note.textContent = `线上 #${slot} 槽 ${name} —— 模型无此执行器，恒为 0`;
+      box.appendChild(note);
+      continue;
+    }
+    const s = D.servos.find(v => v.slot === slot);
+    const row = document.createElement("div");
+    row.className = "row";
+    const lab = document.createElement("div");
+    lab.className = "lab";
+    lab.innerHTML = `<span>#${slot} ${s.cn} <span style="color:#6b7280">${name}</span></span>` +
+                    `<span class="val" id="v_${name}" style="color:${COLORS[groupOf(s.body)]}">0.0°</span>`;
+    const inp = document.createElement("input");
+    inp.type = "range";
+    inp.min = s.range[0]; inp.max = s.range[1]; inp.step = 0.005; inp.value = 0;
+    inp.addEventListener("input", () => { values[name] = parseFloat(inp.value); draw(); });
+    row.appendChild(lab); row.appendChild(inp);
+    box.appendChild(row);
+    sliders[name] = inp; values[name] = 0;
+  }
+  const sel = document.getElementById("preset");
+  for (const name of Object.keys(D.presets)) {
+    const opt = document.createElement("option");
+    opt.value = name; opt.textContent = `预设 ${name}`;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener("change", () => applyPreset(sel.value));
+  document.getElementById("zero").addEventListener("click", () => { applyPreset("INIT"); sel.value = "INIT"; });
+  const leg = document.getElementById("legend");
+  leg.innerHTML = ["left", "right", "head", "trunk"]
+    .map(k => `<div><i style="background:${COLORS[k]}"></i>${CN_SIDE[k]}</div>`).join("");
+}
+
+function applyPreset(name) {
+  document.getElementById("preset").value = name;
+  const pose = D.presets[name];
+  D.joint_names.forEach((jname, i) => {
+    if (i === D.mouth_slot) return;
+    values[jname] = pose[i];
+    sliders[jname].value = pose[i];
+  });
+  draw();
+}
+
+// ---- three orthographic views on one canvas ----
+// Each map centres the drawing on the pose's own bounding box (CX/CY/ZOFF
+// from fitScale); gy is the screen fraction where that map's reference
+// sits — the ground line for the elevations, panel centre for the plan.
+const VIEWS = [
+  { cn: "侧视（自 -Y 看）", map: p => [p[0] - CX, p[2] - ZOFF], gy: 0.82 },
+  { cn: "正视（自 +X 看）", map: p => [p[1] - CY, p[2] - ZOFF], gy: 0.82 },
+  { cn: "顶视（自 +Z 看）", map: p => [p[0] - CX, CY - p[1]], gy: 0.5 },
+];
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+let FK = {};
+
+function project(viewIdx, p) {
+  const v = VIEWS[viewIdx];
+  const [x, y] = v.map(p);
+  const pw = cv.width / 3;
+  return [pw * viewIdx + pw / 2 + x * SCALE, cv.height * v.gy - y * SCALE];
+}
+let SCALE = 1200, CX = 0, CY = 0, ZOFF = 0;
+
+function fitScale() {
+  // sample body origins and every box corner, not just centres, so the
+  // fit covers the true extent of the shell
+  const pts = [];
+  for (const b of D.bodies) {
+    const w = FK[b.name];
+    pts.push(w.t.slice());
+    for (const g of b.geoms) {
+      const gw = geomWorld(b, g);
+      if (g.kind !== "box") { pts.push(gw.t); continue; }
+      for (let i = 0; i < 8; i++) {
+        const o = matvec(gw.R, [(i & 1 ? g.size[0] : -g.size[0]),
+                                (i & 2 ? g.size[1] : -g.size[1]),
+                                (i & 4 ? g.size[2] : -g.size[2])]);
+        pts.push([gw.t[0] + o[0], gw.t[1] + o[1], gw.t[2] + o[2]]);
+      }
+    }
+  }
+  ZOFF = Math.min(...pts.map(p => p[2]));
+  CX = (Math.min(...pts.map(p => p[0])) + Math.max(...pts.map(p => p[0]))) / 2;
+  CY = (Math.min(...pts.map(p => p[1])) + Math.max(...pts.map(p => p[1]))) / 2;
+  let mh = 0.05, mz = 0.05;
+  for (const p of pts) {
+    mh = Math.max(mh, Math.abs(p[0] - CX), Math.abs(p[1] - CY));
+    mz = Math.max(mz, p[2] - ZOFF);
+  }
+  SCALE = Math.min((cv.width / 3) * 0.43 / mh, cv.height * 0.75 / mz);
+}
+
+function hull(pts) {
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const lo = [], hi = [];
+  for (let i = 0; i < p.length; i++) {
+    while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p[i]) <= 0) lo.pop();
+    lo.push(p[i]);
+  }
+  for (let i = p.length - 1; i >= 0; i--) {
+    while (hi.length >= 2 && cross(hi[hi.length - 2], hi[hi.length - 1], p[i]) <= 0) hi.pop();
+    hi.push(p[i]);
+  }
+  lo.pop(); hi.pop();
+  return lo.concat(hi);
+}
+
+function drawBox(view, t, R, size, col) {
+  const corners = [];
+  for (let i = 0; i < 8; i++) {
+    const local = [(i & 1 ? size[0] : -size[0]), (i & 2 ? size[1] : -size[1]), (i & 4 ? size[2] : -size[2])];
+    corners.push(project(view, [t[0] + matvec(R, local)[0],
+                                t[1] + matvec(R, local)[1],
+                                t[2] + matvec(R, local)[2]]));
+  }
+  // faint solid silhouette first — 75 wireframe boxes overlap into noise
+  // unless each volume reads as a body
+  const h = hull(corners);
+  ctx.globalAlpha = 0.13; ctx.fillStyle = col;
+  ctx.beginPath(); ctx.moveTo(...h[0]);
+  for (let i = 1; i < h.length; i++) ctx.lineTo(...h[i]);
+  ctx.closePath(); ctx.fill();
+  ctx.globalAlpha = 1;
+  const E = [[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
+  ctx.beginPath();
+  for (const [a, b] of E) { ctx.moveTo(...corners[a]); ctx.lineTo(...corners[b]); }
+  ctx.stroke();
+}
+
+function draw() {
+  FK = fk(D, values);
+  const dpr = window.devicePixelRatio || 1;
+  const rect = cv.getBoundingClientRect();
+  cv.width = rect.width * dpr; cv.height = rect.height * dpr;
+  fitScale();
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.lineJoin = "round";
+  for (let v = 0; v < 3; v++) {
+    // panel frame + ground line at z=0 (side/front only)
+    ctx.strokeStyle = "#2a2e36";
+    ctx.strokeRect(v * cv.width / 3 + 2, 2, cv.width / 3 - 4, cv.height - 4);
+    if (v < 2) {
+      const g0 = project(v, [CX - 1, 0, ZOFF]), g1 = project(v, [CX + 1, 0, ZOFF]);
+      ctx.strokeStyle = "#3a414c"; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(g0[0], g0[1]); ctx.lineTo(g1[0], g1[1]); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.fillStyle = "#8b93a0";
+    ctx.font = `${12 * dpr}px system-ui`;
+    ctx.fillText(VIEWS[v].cn, v * cv.width / 3 + 10 * dpr, 18 * dpr);
+
+    // bones first (thin, parent origin -> body origin)
+    ctx.strokeStyle = "#4b5260"; ctx.lineWidth = 2 * dpr;
+    for (const b of D.bodies) {
+      if (!b.parent || !FK[b.parent]) continue;
+      ctx.beginPath();
+      ctx.moveTo(...project(v, FK[b.parent].t));
+      ctx.lineTo(...project(v, FK[b.name].t));
+      ctx.stroke();
+    }
+    // volumes
+    for (const b of D.bodies) {
+      const col = COLORS[groupOf(b.name)];
+      for (const g of b.geoms) {
+        const w = geomWorld(b, g);
+        ctx.strokeStyle = col; ctx.fillStyle = col;
+        if (g.kind === "box") {
+          ctx.lineWidth = 1.2 * dpr;
+          drawBox(v, w.t, w.R, g.size, col);
+        } else if (g.kind === "sphere") {
+          const c = project(v, w.t);
+          ctx.beginPath();
+          ctx.arc(c[0], c[1], Math.max(1.5, g.size[0] * SCALE), 0, 7);
+          ctx.stroke();
+        } else if (g.kind === "capsule") {
+          const p1 = [w.t[0] + matvec(w.R, [0, 0, g.size[1]])[0],
+                      w.t[1] + matvec(w.R, [0, 0, g.size[1]])[1],
+                      w.t[2] + matvec(w.R, [0, 0, g.size[1]])[2]];
+          const p2 = [w.t[0] - matvec(w.R, [0, 0, g.size[1]])[0],
+                      w.t[1] - matvec(w.R, [0, 0, g.size[1]])[1],
+                      w.t[2] - matvec(w.R, [0, 0, g.size[1]])[2]];
+          ctx.lineWidth = Math.max(1.5, 2 * g.size[0] * SCALE);
+          ctx.beginPath(); ctx.moveTo(...project(v, p1)); ctx.lineTo(...project(v, p2)); ctx.stroke();
+        }
+      }
+    }
+    // joint markers on top
+    for (const s of D.servos) {
+      const c = project(v, FK[s.body].t);
+      ctx.fillStyle = "#e8eaed";
+      ctx.beginPath(); ctx.arc(c[0], c[1], 2.2 * dpr, 0, 7); ctx.fill();
+    }
+  }
+  // slider value labels
+  for (const name in sliders) {
+    document.getElementById(`v_${name}`).textContent =
+      (values[name] * N_DEG).toFixed(1) + "°";
+  }
+}
+
+buildPanel();
+applyPreset(new URLSearchParams(location.search).get("pose") || "INIT");
+window.addEventListener("resize", draw);
+</script>
+</body>
+</html>
