@@ -181,7 +181,8 @@ viewers = 0  # connected MJPEG clients; the mirror renders only for these
 follow_duck = False
 lookat_xy = [0.0, 0.0]
 FOLLOW_EASE = 0.15  # per frame at FPS — ~0.5 s time constant
-# Second locked view: the classic isometric (yaw 45°, pitch 35.264°), same
+# Second locked view: the diagonal oblique (yaw 45°, pitched down ~50° in
+# the 仙剑一 style — steeper than the 35.264° true isometric), same
 # orthographic projection, rotation locked like the top view. follow_duck
 # still chooses what the lookat tracks.
 iso_view = False
@@ -359,10 +360,11 @@ def render_frame(reading: dict) -> None:
     camera.lookat[1] = lookat_xy[1]
 
     # Both views are rotation-locked fixed poses; only the lookat eases.
-    # Elevation is negative-from-above in MuJoCo, so the 35.264° iso pitch
-    # (atan(1/√2)) is -35.264 here.
+    # The oblique view is pitched to -50 (negative-from-above in MuJoCo) —
+    # chosen from a 35.264/45/50/55 sweep to match 仙剑一's high diagonal
+    # look while keeping the duck reading as three-dimensional.
     camera.azimuth, camera.elevation = (
-        (45.0, -35.264) if iso_view else (90.0, -90.0))
+        (45.0, -50.0) if iso_view else (90.0, -90.0))
 
     renderer.update_scene(data, camera=camera)
     rgb = renderer.render()
