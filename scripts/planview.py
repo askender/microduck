@@ -249,10 +249,13 @@ threading.Thread(target=kbd_emitter, daemon=True).start()
 # the drift visible while driving. Reconnects when robotd does.
 odom_lock = threading.Lock()
 odom_pose = None  # [x, y, yaw_deg]
+brain_policy = None  # robotd's own word for the tick: walk / stand / held
+loop_hz = None  # control loop's achieved rate, from the same frames
+state_ts = 0.0  # when the last robot.state arrived — its staleness is the display's
 
 
 def odom_loop() -> None:
-    global odom_pose
+    global odom_pose, brain_policy, loop_hz, state_ts
     while True:
         try:
             s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(DUCK_SOCK)
@@ -263,10 +266,14 @@ def odom_loop() -> None:
             for line in f:
                 m = json.loads(line)
                 if m.get("method") == "robot.state":
-                    od = m["params"]["odom"]
+                    st = m["params"]
+                    od = st["odom"]
                     with odom_lock:
                         odom_pose = [od["position"][0], od["position"][1],
                                      math.degrees(od["yaw"])]
+                        brain_policy = st.get("policy")
+                        loop_hz = (st.get("loop") or {}).get("hz")
+                        state_ts = time.time()
         except (OSError, ValueError):
             pass
         time.sleep(3.0)  # robotd away or restarted; try again
@@ -509,7 +516,7 @@ PAGE = """<!doctype html>
     <label>转向 vyaw <span class="yawv" id="yawv">0.0</span></label>
     <input id="yaw" type="range" min="-2" max="2" step="0.1" value="0">
   </div>
-  <div id="hint">键盘（先点一下页面）<br>W 前进 · S 后退<br>A/D 原地转向（Shift 精细 ~10°）<br>W+A 行进转弯 · Q/E 方向盘渐增回正</div>
+  <div id="hint">键盘（先点一下页面）<br>W 前进 · S 后退<br>A/D 原地转向（Shift 精细 ~10°）<br>W+A 行进转弯 · Q/E 方向盘渐增回正<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
 <main><img src="/stream?follow={follow}"></main>
@@ -533,6 +540,20 @@ async function refresh() {{
     s += '\\n里程误差 ' + Math.hypot(r.odom[0] - r.pos[0],
                                      r.odom[1] - r.pos[1]).toFixed(2) + ' m';
   }}
+  if (r.brain != null) {{
+    if (r.brain_age > 5) {{
+      s += '\\n🧠 无流（板子离线?）';
+    }} else {{
+      const on = r.brain !== 'held';
+      s += '\\n🧠 大脑 ' + (on ? '开 (' + r.brain + ')' : '关 (held)');
+      $('brain').textContent = '🧠 大脑 ' + (on ? 'on' : 'off');
+    }}
+  }}
+  if (r.gate && r.gate.ok) {{
+    if (!r.gate.armed) s += '\\n心跳 未上膛（页面开着就喂养）';
+    else if (r.gate.starved) s += '\\n心跳 断供中 — 板子已停车';
+    else s += '\\n心跳 喂养中（' + Math.max(0, Math.round(r.gate.timeout_s - r.gate.age_s)) + 's 后停车）';
+  }}
   $('st').textContent = s;
 }}
 $('pause').onclick = async () => {{ await fetch('/toggle'); refresh(); }};
@@ -548,15 +569,18 @@ $('brain').onclick = async () => {{
   if (!r.ok) {{ alert(r.msg || 'robot.enable failed'); return; }}
   $('brain').textContent = '🧠 大脑 ' + (turning_on ? 'on' : 'off');
 }};
-// heartbeat: the body server stops the board's policy when nobody watches.
-// Beats go only while this tab is actually visible — hiding the tab for the
-// gate timeout is how the brain gets parked. A returning beat reopens the
-// gate and the board re-associates on its own.
+// The body server parks the board when nobody watches. Beats go only while
+// this tab is visible; hiding or closing it first sends a farewell — the
+// brain turns off gracefully (the duck walks home, no mid-stride freeze) —
+// and the gate then cuts the link on its own schedule. Coming back re-arms
+// the gate; the brain stays off until the 🧠 button is pressed.
 const beat = () => fetch('/ctl/heartbeat', {{method: 'POST'}}).catch(() => {{}});
-setInterval(() => {{ if (document.visibilityState === 'visible') beat(); }}, 20000);
+const bye = () => navigator.sendBeacon && navigator.sendBeacon('/ctl/bye');
 document.addEventListener('visibilitychange', () => {{
-  if (document.visibilityState === 'visible') beat();
+  if (document.visibilityState === 'visible') beat(); else bye();
 }});
+addEventListener('pagehide', bye);
+setInterval(() => {{ if (document.visibilityState === 'visible') beat(); }}, 20000);
 beat();
 document.querySelectorAll('[data-skill]').forEach(b => {{
   b.onclick = async () => {{
@@ -662,8 +686,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/status"):
             with odom_lock:
                 odom = list(odom_pose) if odom_pose is not None else None
+                brain, hz = brain_policy, loop_hz
+                brain_age = time.time() - state_ts if state_ts else None
             self._json({"paused": paused, "fps": FPS, "frames": frame_count,
-                        "follow": follow_duck, "pos": last_pose, "odom": odom})
+                        "follow": follow_duck, "pos": last_pose, "odom": odom,
+                        "brain": brain, "brain_age": brain_age, "loop_hz": hz,
+                        "gate": self._gate(beat=False)})
             return
         if self.path.startswith("/toggle"):
             paused = not paused
@@ -705,10 +733,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "msg": msg})
             return
         if self.path.startswith("/ctl/heartbeat"):
-            # The page beats every 20 s while visible; the body server's gate
-            # arms on the first beat and refuses the board's connections when
-            # the beats stop — see HEARTBEAT_TIMEOUT_S there.
-            self._heartbeat()
+            # GET asks the gate's state; the page's beats are POSTs (below).
+            self._json(self._gate(beat=False))
+            return
+        if self.path.startswith("/ctl/bye"):
+            self._bye()
             return
         if self.path.startswith("/ctl/keys"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -762,22 +791,42 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        # The page's heartbeat is a POST; every other control here is GET.
+        # The page's heartbeat and farewell are POSTs; every other control
+        # here is GET.
         if self.path.startswith("/ctl/heartbeat"):
-            self._heartbeat()
+            self._json(self._gate(beat=True))
+        elif self.path.startswith("/ctl/bye"):
+            self._bye()
         else:
             self.send_error(501)
 
-    def _heartbeat(self):
+    def _gate(self, beat: bool):
+        # beat=True is the page's 20 s keep-alive; beat=False asks the gate's
+        # state. The body server's gate arms on the first beat and hangs the
+        # board up when the beats stop — see HEARTBEAT_TIMEOUT_S there.
         try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{BODY_PORT + 2}/heartbeat", data=b"", timeout=2
-            ) as reply:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{BODY_PORT + 2}/heartbeat",
+                data=b"" if beat else None, method="POST" if beat else "GET")
+            with urllib.request.urlopen(req, timeout=2) as reply:
                 body = json.loads(reply.read())
             ok = True
         except OSError as error:
             body, ok = {"error": str(error)}, False
-        self._json({"ok": ok, **body})
+        return {"ok": ok, **body}
+
+    def _bye(self):
+        # The page's farewell, sent when the tab hides or closes: turn the
+        # brain off gracefully while the link is still up — the duck walks to
+        # its home pose — and let the gate cut the link on its own schedule.
+        try:
+            reply = duck_rpc({"jsonrpc": "2.0", "id": 12, "method": "robot.enable",
+                              "params": {"on": False}}, wait=True)
+            ok, msg = True, str(reply)
+        except OSError as error:
+            ok, msg = False, str(error)
+        print(f"planview: bye (tab hidden/closed) -> brain off -> {msg}", flush=True)
+        self._json({"ok": ok, "msg": msg})
 
     def _json(self, obj: dict) -> None:
         body = json.dumps(obj).encode()
