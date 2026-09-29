@@ -67,6 +67,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import mujoco
@@ -402,15 +403,22 @@ def paused_overlay() -> None:
 def mirror_loop() -> None:
     """Poll the body server and render, forever.
 
-    When the body server goes away (e.g. its 3D window was closed, which
-    exits the whole simulator), post a DISCONNECTED banner so the browser
-    shows a clearly-dead view instead of a frozen frame that looks alive.
+    When the body server goes away (its 3D window closed, a restart, or the
+    heartbeat gate refusing connections), show a clearly-dead DISCONNECTED
+    banner instead of a frozen frame that looks alive — and retry, because
+    every reason the server disappears is also a reason it comes back: the
+    gate reopens on the next heartbeat, and the next read renders again.
     """
-    try:
-        run_mirror()
-    except Exception as error:
-        print(f"planview: the body server went away ({error})", flush=True)
-        banner(f"sim disconnected: {error}", "restart it: scripts/duck-sim")
+    init_gl()
+    while True:
+        try:
+            run_mirror()
+            return
+        except Exception as error:
+            print(f"planview: body server unreachable ({error}) — retrying in 2 s", flush=True)
+            banner("sim disconnected — retrying", "the body server refused or went away; "
+                   "reconnects on its own")
+            time.sleep(2.0)
 
 
 def banner(line1: str, line2: str) -> None:
@@ -428,7 +436,6 @@ def banner(line1: str, line2: str) -> None:
 
 
 def run_mirror() -> None:
-    init_gl()
     body = socket.socket()
     body.settimeout(5)
     body.connect(("127.0.0.1", BODY_PORT))
@@ -541,6 +548,16 @@ $('brain').onclick = async () => {{
   if (!r.ok) {{ alert(r.msg || 'robot.enable failed'); return; }}
   $('brain').textContent = '🧠 大脑 ' + (turning_on ? 'on' : 'off');
 }};
+// heartbeat: the body server stops the board's policy when nobody watches.
+// Beats go only while this tab is actually visible — hiding the tab for the
+// gate timeout is how the brain gets parked. A returning beat reopens the
+// gate and the board re-associates on its own.
+const beat = () => fetch('/ctl/heartbeat', {{method: 'POST'}}).catch(() => {{}});
+setInterval(() => {{ if (document.visibilityState === 'visible') beat(); }}, 20000);
+document.addEventListener('visibilitychange', () => {{
+  if (document.visibilityState === 'visible') beat();
+}});
+beat();
 document.querySelectorAll('[data-skill]').forEach(b => {{
   b.onclick = async () => {{
     b.disabled = true;
@@ -687,6 +704,12 @@ class Handler(BaseHTTPRequestHandler):
             print(f"planview: brain {'on' if on else 'off'} -> {msg}", flush=True)
             self._json({"ok": ok, "msg": msg})
             return
+        if self.path.startswith("/ctl/heartbeat"):
+            # The page beats every 20 s while visible; the body server's gate
+            # arms on the first beat and refuses the board's connections when
+            # the beats stop — see HEARTBEAT_TIMEOUT_S there.
+            self._heartbeat()
+            return
         if self.path.startswith("/ctl/keys"):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -737,6 +760,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        # The page's heartbeat is a POST; every other control here is GET.
+        if self.path.startswith("/ctl/heartbeat"):
+            self._heartbeat()
+        else:
+            self.send_error(501)
+
+    def _heartbeat(self):
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{BODY_PORT + 2}/heartbeat", data=b"", timeout=2
+            ) as reply:
+                body = json.loads(reply.read())
+            ok = True
+        except OSError as error:
+            body, ok = {"error": str(error)}, False
+        self._json({"ok": ok, **body})
 
     def _json(self, obj: dict) -> None:
         body = json.dumps(obj).encode()
