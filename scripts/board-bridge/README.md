@@ -28,9 +28,10 @@ Two layers; do not confuse them:
         rm    ~/.cache/duck-sim/mitm.on    # stop recording
 
 The log grows ~2.5 MB/min while on — turn it off when done. Line format:
-`C>` prefixes board→sim traffic (write targets, gain, torque), `S>` prefixes
-sim→board SensorFrames (positions / velocities / currents, IMU), one JSON
-object per line, in wire order.
+a run-scoped line counter (appends continue the count), then `C>` prefixes
+board→sim traffic (write targets, gain, torque), `S>` prefixes sim→board
+SensorFrames (positions / velocities / currents, IMU), one JSON object per
+line, in wire order. `analyze_mitm.py` counts message kinds per direction.
 
 ## tunnel_watch.sh — the tunnels' keeper
 
