@@ -913,14 +913,26 @@ print(f"pose: error {err:.2f} m, {math.degrees(yaw_err):+.0f} deg (fallen={falle
 PY
 }
 
+# ── state-dir clients ────────────────────────────────────────────────────────
+# planview.py and wander.py are sources in `scripts/`, installed into the
+# state directory on use — the state copy is what runs, next to the sockets.
+# A state copy newer than the repo one wins, so a live hand edit done while
+# the duck is up survives the next start; delete the state copy to get the
+# repo version back.
+install_client() {
+    [ "$STATE/$1.py" -nt "$REPO/scripts/$1.py" ] || cp "$REPO/scripts/$1.py" "$STATE/$1.py"
+}
+
 # ── wandering ─────────────────────────────────────────────────────────────
-# `wander.py` (kept in the state directory, not the repo) is the random-walk
+# `wander.py` (installed into the state directory from `scripts/wander.py`)
+# is the random-walk
 # client: a fresh random twist every few seconds, streamed as `robot.move`
 # intents at 10 Hz. It owns nothing — the deadman expires its intents 500 ms
 # after it exits, so stopping it parks the duck. Managed here so starting and
 # stopping are one word each and `down`/`up` cannot strand one running against
 # a daemon they just replaced.
 wander() {
+    install_client wander
     [ -f "$STATE/wander.py" ] || die "no wander client at $STATE/wander.py"
     case "${1:-}" in
         "")
@@ -947,7 +959,8 @@ wander() {
 }
 
 # ── plan view ────────────────────────────────────────────────────────────────
-# `planview.py` (kept in the state directory, like wander.py) is a live
+# `planview.py` (installed into the state directory from the repo, like
+# wander.py) is a live
 # top-down ORTHOGRAPHIC view of the sim, served as an MJPEG stream for a
 # browser. It is a mirror, not a second sim: it polls the body server's public
 # `read` op, rebuilds the same scene's qpos from the reply, renders one frame
@@ -956,6 +969,7 @@ wander() {
 # sharegroup, and GL is thread-affine, so all rendering happens on the mirror
 # thread inside the process.
 planview() {
+    install_client planview
     [ -f "$STATE/planview.py" ] || die "no planview client at $STATE/planview.py"
     case "${1:-}" in
         "")

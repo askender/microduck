@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""Live top-down plan view of the duck sim, in a browser.
+
+A mirror, not a second sim: this process polls the body server's `read` op at
+~12 Hz, rebuilds the same MJCF model's qpos from the reply (trunk xyz + trunk
+quat + the fourteen actuated joints), renders one ORTHOGRAPHIC top-down frame
+per poll, and serves them as an MJPEG stream. Open http://localhost:8910/
+while the sim runs.
+
+Run this under `mjpython`, not plain python: on macOS the offscreen renderer
+only produces correct, deterministic output when a GL sharegroup exists —
+plain python's CGL offscreen context drops world geoms and moves objects
+between frames. Verified 2026-09-27 with calibration spheres at known world
+positions; azimuth 90 is the map convention (+x right, +y up).
+
+Camera modes: by default the view is pinned to the world origin. Open
+http://localhost:8910/?follow=1 and the camera eases onto the duck
+(?follow=0 eases back to the origin). The yellow home disc is a 2D overlay,
+so it stays correct in both modes.
+
+Endpoints: `/` serves a small control page — sidebar buttons for every
+control that already exists (pause/resume rendering, camera follow on/off,
+walk forward 3 s, sit/stand toggle, walk home, the one-shot skills, health),
+plus WASD keyboard drive and a yaw slider; the stream fills the viewport
+beside them, no scrolling.
+`/stream` is the MJPEG feed (the follow flag lives here); `/toggle` flips
+rendering on and off; `/status` reports state as JSON, including the duck's
+OWN pose estimate (a 2 Hz `robot.subscribe` thread) beside the ground truth
+so the drift is visible; `/ctl/follow|drive|sit|home|skill|health` are what
+the buttons press — `/ctl/skill?name=` runs a `robot.do` one-shot (roulade,
+kick_left, kick_right, ground_pick — whitelisted against the live skill
+list, probed once from a bogus name's refusal), and `/ctl/health` shells out
+to `robotctl health` with the sim's sockets; `/ctl/keys?vx=&vy=&vyaw=` carries the
+held-key state — a thread retransmits it at 10 Hz and goes idle 0.7 s after
+updates stop (robotd's 500 ms deadman then stops the duck). The key values
+are the measured dependable gaits: forward 0.5, backward -0.8 (small reverse
+commands engage nothing), A/D spin in place at vyaw ±2 (~60 deg/s, radius
+~0.01 m — the angular channel is dead below |vyaw| ~1.5, measured 2026-09-28,
+/tmp/turn_sweep.py); held with W/S they become arcs (W+A walks 0.20 m/s at
+R ≈ 0.2 m). A tap is one turning step, ~25-30 deg — the floor however brief
+the tap — and Shift+A/D are fine taps at ±1.5 (~10 deg each, occasionally
+not entraining at the threshold edge; tap again). Raw strafe is not offered —
+the policy answers vy by drifting
+and yawing. Q/E is a steering wheel: vyaw ramps up 0.25 per 100 ms while
+held (full lock ±2 in 0.8 s) and springs back four times faster on release.
+The slider sets the same vyaw directly and mirrors the wheel. Paused, the mirror
+thread idles and the last frame keeps being served — the picture freezes
+instead of going black, stamped PAUSED. That is the further power save: the
+12 fps GL render + JPEG encode is essentially all of this process's CPU.
+
+Deliberately a client of the public `read` op rather than a patch to
+body_server: the simulator's loop is untouched, and the only cost is one
+offscreen 640x640 render per frame in this process. The yellow home disc shows
+up because the scene XML is the same one the sim loaded (pass DUCK_SIM_SCENE
+through if it is not in the environment).
+
+    DUCK_SIM_BODY_PORT        body server port        (default 7801)
+    DUCK_SIM_SCENE            scene XML the sim uses  (default RL repo scene.xml)
+    DUCK_SIM_PLANVIEW_PORT    this HTTP port          (default 8910)
+"""
+import io
+import json
+import math
+import os
+import socket
+import subprocess
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import mujoco
+from PIL import Image
+
+
+def yaw_degrees(q):
+    """Trunk yaw in degrees from an IMU quat (w, x, y, z)."""
+    return math.degrees(math.atan2(2 * (q[0] * q[3] + q[1] * q[2]),
+                                   1 - 2 * (q[2] * q[2] + q[3] * q[3])))
+
+BODY_PORT = int(os.environ.get("DUCK_SIM_BODY_PORT", "7801"))
+SCENE = os.environ.get(
+    "DUCK_SIM_SCENE",
+    os.path.expanduser(
+        "~/Pollen/microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml"
+    ),
+)
+HTTP_PORT = int(os.environ.get("DUCK_SIM_PLANVIEW_PORT", "8910"))
+FPS = 12
+SIZE = 640
+
+# This file lives in the sim's state dir, next to the duck's IPC sockets.
+STATE_DIR = os.path.dirname(os.path.abspath(__file__))
+DUCK_SOCK = os.path.join(STATE_DIR, "duck-a.sock")
+if not os.path.exists(DUCK_SOCK):
+    DUCK_SOCK = os.path.join(STATE_DIR, "duck.sock")
+# Passed by scripts/duck-sim's planview() — needed to shell out to `home`.
+REPO = os.environ.get("DUCK_SIM_REPO", "")
+
+# Offscreen ortho vertical extent in metres per unit of camera distance
+# (= 2*tan(45°/2)); verified against the GL-rendered home_disc, whose radius
+# is exactly half a 0.40 m checker cell. The on-screen GL window is ~2.23x
+# wider at the same distance — do not copy figures across the two.
+ORTHO_FACTOR = 0.82843
+
+# Protocol constant, duplicated from body_server.py (which duplicates
+# duck_ipc_proto::JOINT_NAMES) — the wire arrays are indexed by this order.
+JOINT_NAMES = (
+    "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle",
+    "neck_pitch", "head_pitch", "head_yaw", "head_roll", "mouth",
+    "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle",
+)
+
+model = None
+data = None
+renderer = None
+camera = None
+trunk_qpos = 0
+joint_qpos = []
+gl_ready = threading.Event()
+
+
+def init_gl() -> None:
+    """Build the mirror model and renderer — called on the mirror thread.
+
+    GL contexts are thread-affine: everything that touches mujoco rendering
+    must happen on ONE thread. Module level only parses arguments; the model,
+    renderer and every render live in mirror_loop's thread.
+    """
+    global model, data, renderer, camera, trunk_qpos, joint_qpos
+    model = mujoco.MjModel.from_xml_path(SCENE)
+    # The renderer caps at the model's offscreen framebuffer; the stock
+    # scenes ship the 640x480 default.
+    model.vis.global_.offwidth = SIZE
+    model.vis.global_.offheight = SIZE
+    data = mujoco.MjData(model)
+
+    trunk_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
+    trunk_qpos = model.jnt_qposadr[trunk_joint]
+
+    # Actuator name -> qpos address, in JOINT_NAMES order, skipping the mouth
+    # (no actuator — "fifteen joints out here, fourteen in the model").
+    for name in JOINT_NAMES:
+        act = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        if act < 0:
+            continue
+        joint = model.actuator_trnid[act, 0]
+        joint_qpos.append((JOINT_NAMES.index(name), model.jnt_qposadr[joint]))
+
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+    camera.fixedcamid = -1
+    camera.lookat[:] = [0.0, 0.0, 0.0]
+    camera.elevation = -90.0
+    camera.orthographic = True
+    # Calibrated 2026-09-27 with calibration spheres in a GL window: azimuth 90
+    # over the origin is the map convention — world +x renders to the right,
+    # world +y up, axes orthogonal, chirality preserved.
+    # Scale (corrected 2026-09-28): the OFFSCREEN ortho camera covers
+    # 0.828*distance metres vertically (= 2*tan(45°/2)), NOT the 4.9 m the
+    # on-screen GL window shows at the same distance — the old figure came
+    # from the window and was wrong here, which is why the home-disc overlay
+    # used to be drawn at less than half the GL-rendered disc's size.
+    # In this MuJoCo (3.10) MjvCamera exposes no fovy; distance IS the zoom.
+    camera.azimuth = 90.0
+    camera.distance = 2.2
+
+    renderer = mujoco.Renderer(model, height=SIZE, width=SIZE)
+    gl_ready.set()
+
+frame_lock = threading.Lock()
+latest_jpeg = None
+
+# Camera modes. The default frame is pinned to the world origin; `?follow=1`
+# in the stream URL eases the camera's lookat onto the duck instead (and back
+# to the origin with `?follow=0`). A per-tab choice would be nicer, but one
+# global flag keeps the mirror trivial — the last connected viewer wins.
+follow_duck = False
+lookat_xy = [0.0, 0.0]
+FOLLOW_EASE = 0.15  # per frame at FPS — ~0.5 s time constant
+
+# Rendering on/off, global like the camera mode (one renderer, last viewer
+# wins). Paused: the mirror loop idles and the last JPEG keeps being served.
+paused = False
+frame_count = 0
+last_pose = None  # (x, y, yaw_deg) from the most recent mirror reading
+
+
+def duck_rpc(obj, wait=False, timeout=3.0):
+    """One JSON-RPC request/notification on the duck's IPC socket."""
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(timeout)
+    s.connect(DUCK_SOCK)
+    f = s.makefile("rw")
+    f.write(json.dumps(obj) + "\n")
+    f.flush()
+    reply = f.readline() if wait else None
+    s.close()
+    return reply
+
+
+def drive_leg():
+    """The 'walk forward' button: 3 s at vx 0.3, the dependable slow gait."""
+    t0 = time.time()
+    while time.time() - t0 < 3.0:
+        try:
+            duck_rpc({"jsonrpc": "2.0", "method": "robot.move",
+                      "params": {"vx": 0.3, "vy": 0.0, "vyaw": 0.0}})
+        except OSError as error:
+            print(f"planview: drive failed: {error}", flush=True)
+            return
+        time.sleep(0.1)
+    print("planview: drive leg done", flush=True)
+
+
+home_proc = None
+
+
+# Held-key drive state. The page reports what is held (W/S/A/D + the yaw
+# slider) and a thread here retransmits robot.move at 10 Hz for as long as
+# updates stay fresh — robotd's 500 ms deadman drops motion after the last
+# command, so updates going quiet IS the stop signal. Values are the measured
+# dependable gaits: forward 0.5, backward -0.8 (small backward commands do
+# nothing — the policy needs |vx| ~0.8 to engage reverse), arcs need some vx.
+kbd_lock = threading.Lock()
+kbd_state = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "ts": 0.0}
+KBD_FRESH = 0.7  # s without an update before the emitter goes idle
+
+
+def kbd_emitter() -> None:
+    while True:
+        with kbd_lock:
+            st = dict(kbd_state)
+        if time.time() - st["ts"] < KBD_FRESH and (st["vx"] or st["vy"] or st["vyaw"]):
+            try:
+                duck_rpc({"jsonrpc": "2.0", "method": "robot.move",
+                          "params": {"vx": st["vx"], "vy": st["vy"], "vyaw": st["vyaw"]}})
+            except OSError as error:
+                print(f"planview: key drive failed: {error}", flush=True)
+        time.sleep(0.1)
+
+
+threading.Thread(target=kbd_emitter, daemon=True).start()
+
+# The duck's own pose estimate, for the status line: a persistent
+# robot.subscribe stream at 2 Hz. robotd's contact-based odometry is all the
+# robot itself knows; showing it beside the body server's ground truth makes
+# the drift visible while driving. Reconnects when robotd does.
+odom_lock = threading.Lock()
+odom_pose = None  # [x, y, yaw_deg]
+
+
+def odom_loop() -> None:
+    global odom_pose
+    while True:
+        try:
+            s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(DUCK_SOCK)
+            f = s.makefile("rw")
+            f.write(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "robot.subscribe",
+                                "params": {"hz": 2}}) + "\n"); f.flush()
+            f.readline()  # the ack names policies, not state
+            for line in f:
+                m = json.loads(line)
+                if m.get("method") == "robot.state":
+                    od = m["params"]["odom"]
+                    with odom_lock:
+                        odom_pose = [od["position"][0], od["position"][1],
+                                     math.degrees(od["yaw"])]
+        except (OSError, ValueError):
+            pass
+        time.sleep(3.0)  # robotd away or restarted; try again
+
+
+threading.Thread(target=odom_loop, daemon=True).start()
+
+# The one-shot skills this robot's `robot.do` answers to, probed once: a
+# bogus name's refusal lists them. Skill buttons are whitelisted against it.
+skills_cache = None
+
+
+def skill_list():
+    global skills_cache
+    if skills_cache is None:
+        try:
+            reply = duck_rpc({"jsonrpc": "2.0", "id": 8, "method": "robot.do",
+                              "params": {"skill": "?list"}}, wait=True)
+            reason = json.loads(reply)["result"]["reason"]
+            at = reason.find("this robot has ")
+            if at < 0:
+                raise ValueError(reason)
+            skills_cache = [n.strip() for n in reason[at + 15:].split(",")]
+        except (OSError, ValueError, KeyError) as error:
+            print(f"planview: skill probe failed ({error})", flush=True)
+            skills_cache = ["sit_toggle", "roulade", "kick_left", "kick_right",
+                            "ground_pick"]
+    return skills_cache
+
+
+
+def start_home():
+    """The 'walk home' button: the controller lives in scripts/duck-sim."""
+    global home_proc
+    if not REPO:
+        return False, "DUCK_SIM_REPO not set — restart planview via scripts/duck-sim"
+    if home_proc is not None and home_proc.poll() is None:
+        return False, "home is already running"
+    home_proc = subprocess.Popen([os.path.join(REPO, "scripts", "duck-sim"), "home"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True, "home started"
+
+
+def ctl_health() -> str:
+    """`scripts/duck-sim ctl health`, as text — robotctl with the sim's sockets."""
+    if not REPO:
+        return "DUCK_SIM_REPO not set — restart planview via scripts/duck-sim"
+    stem = os.path.basename(DUCK_SOCK)[:-5]  # duck-a.sock -> duck-a
+    try:
+        out = subprocess.run(
+            [os.path.join(REPO, "target", "debug", "robotctl"),
+             "--robot-socket", DUCK_SOCK,
+             "--tof-socket", os.path.join(STATE_DIR, stem + "-tof.sock"),
+             "--config-socket", os.path.join(STATE_DIR, stem + "-config.sock"),
+             "--socket", os.path.join(STATE_DIR, stem + "-updater.sock"),
+             "health"], capture_output=True, text=True, timeout=10)
+        return out.stdout + out.stderr
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"health failed: {error}"
+
+
+def render_frame(reading: dict) -> None:
+    global latest_jpeg, frame_count, last_pose
+    data.qpos[trunk_qpos : trunk_qpos + 3] = reading["trunk"]
+    q = reading["imu"]["quat"]  # w, x, y, z — same order as qpos
+    data.qpos[trunk_qpos + 3 : trunk_qpos + 7] = q
+    positions = reading["positions"]
+    for wire_index, adr in joint_qpos:
+        data.qpos[adr] = positions[wire_index]
+    mujoco.mj_forward(model, data)
+    last_pose = (reading["trunk"][0], reading["trunk"][1], yaw_degrees(q))
+
+    target = reading["trunk"][0:2] if follow_duck else (0.0, 0.0)
+    lookat_xy[0] += FOLLOW_EASE * (target[0] - lookat_xy[0])
+    lookat_xy[1] += FOLLOW_EASE * (target[1] - lookat_xy[1])
+    camera.lookat[0] = lookat_xy[0]
+    camera.lookat[1] = lookat_xy[1]
+
+    renderer.update_scene(data, camera=camera)
+    rgb = renderer.render()
+    img = Image.fromarray(rgb)
+    # --- Home-disc 2D overlay: TEMPORARILY DISABLED 2026-09-28 — the user
+    # --- wants only the world geom (the GL-rendered home_disc) for now.
+    # --- Re-enable by uncommenting the block below.
+    # # The home marker as a 2D overlay. The macOS offscreen GL renderer
+    # # drops world geoms unpredictably over long runs (the floor survives,
+    # # the disc does not) — drawing it here guarantees the yellow circle is
+    # # always there.
+    # # Projection: world +x is screen right, +y is screen up; the offscreen
+    # # ortho camera covers ORTHO_FACTOR*distance metres vertically, so a
+    # # world point p lands at
+    # #   (SIZE/2 + (px - lx) * s, SIZE/2 - (py - ly) * s),  s = SIZE / extent.
+    # extent_m = ORTHO_FACTOR * camera.distance
+    # s = SIZE / extent_m
+    # overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    # from PIL import ImageDraw
+    # draw = ImageDraw.Draw(overlay)
+    # r = 0.2 * s
+    # cx = SIZE / 2 - lookat_xy[0] * s
+    # cy = SIZE / 2 + lookat_xy[1] * s
+    # # Alpha 110 over the light checker cells read as "not rendered" — go
+    # # nearly opaque and ring it so it survives both checker colours.
+    # draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 200, 0, 190),
+    #              outline=(60, 48, 0, 255), width=3)
+    # dot = 3
+    # draw.ellipse([cx - dot, cy - dot, cx + dot, cy + dot], fill=(60, 48, 0, 255))
+    # img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82)
+    with frame_lock:
+        latest_jpeg = buf.getvalue()
+    frame_count += 1
+
+
+def paused_overlay() -> None:
+    """Stamp PAUSED on the frozen frame once, when pausing — pure PIL."""
+    global latest_jpeg
+    with frame_lock:
+        jpeg = latest_jpeg
+    if jpeg is None:
+        banner("paused", "rendering stopped — press resume")
+        return
+    img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([6, 6, 104, 28], fill=(18, 18, 24))
+    draw.text((14, 11), "PAUSED", fill=(255, 216, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82)
+    with frame_lock:
+        latest_jpeg = buf.getvalue()
+
+
+def mirror_loop() -> None:
+    """Poll the body server and render, forever.
+
+    When the body server goes away (e.g. its 3D window was closed, which
+    exits the whole simulator), post a DISCONNECTED banner so the browser
+    shows a clearly-dead view instead of a frozen frame that looks alive.
+    """
+    try:
+        run_mirror()
+    except Exception as error:
+        print(f"planview: the body server went away ({error})", flush=True)
+        banner(f"sim disconnected: {error}", "restart it: scripts/duck-sim")
+
+
+def banner(line1: str, line2: str) -> None:
+    """A black frame with white text; pure PIL, no GL needed."""
+    global latest_jpeg
+    img = Image.new("RGB", (SIZE, SIZE), (12, 12, 18))
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    draw.text((SIZE // 2 - 220, SIZE // 2 - 20), line1, fill=(255, 220, 80))
+    draw.text((SIZE // 2 - 200, SIZE // 2 + 20), line2, fill=(200, 200, 200))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82)
+    with frame_lock:
+        latest_jpeg = buf.getvalue()
+
+
+def run_mirror() -> None:
+    init_gl()
+    body = socket.socket()
+    body.settimeout(5)
+    body.connect(("127.0.0.1", BODY_PORT))
+    wire = body.makefile("rw")
+    wire.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n")
+    wire.flush()
+    wire.readline()
+    print(f"planview: mirroring 127.0.0.1:{BODY_PORT}, scene {SCENE}", flush=True)
+    n = 0
+    while True:
+        if paused:
+            # Rendering is the cost; while paused, idle and keep serving the
+            # last frame. The body socket stays open — disconnect is detected
+            # on resume.
+            time.sleep(1.0 / FPS)
+            continue
+        wire.write('{"op":"read"}\n')
+        wire.flush()
+        reading = json.loads(wire.readline())
+        if n == 0:
+            print("planview: first read ok", flush=True)
+        render_frame(reading)
+        n += 1
+        if n <= 3 or n % 60 == 0:
+            print(f"planview: rendered {n} frames", flush=True)
+        time.sleep(1.0 / FPS)
+
+
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>duck plan view</title>
+<style>
+  html, body {{ margin: 0; height: 100%; background: #111; color: #ccc;
+                font: 14px system-ui; overflow: hidden; }}
+  body {{ display: flex; }}
+  aside {{ width: 200px; min-width: 200px; padding: 10px; display: flex;
+          flex-direction: column; gap: 8px; border-right: 1px solid #333;
+          box-sizing: border-box; overflow-y: auto; }}
+  main {{ flex: 1; min-width: 0; display: flex; align-items: center;
+          justify-content: center; }}
+  img {{ max-width: 100%; max-height: 100vh; object-fit: contain; }}
+  button {{ font: inherit; padding: 6px 0; cursor: pointer; width: 100%; }}
+  .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
+  #healthbox {{ display: none; font: 11px/1.5 ui-monospace, monospace;
+               color: #9d9; background: #181818; padding: 8px;
+               border-radius: 4px; white-space: pre-wrap; max-height: 40vh;
+               overflow-y: auto; }}
+  .yaw label {{ font-size: 12px; color: #bbb; }}
+  .yaw input {{ width: 100%; }}
+  .yawv {{ color: #ffd800; }}
+  #hint {{ font-size: 12px; color: #888; line-height: 1.7; }}
+  #st {{ margin-top: auto; font-size: 12px; color: #999;
+         white-space: pre-line; line-height: 1.6; }}
+</style></head>
+<body>
+<aside>
+  <button id="pause">…</button>
+  <button id="follow">…</button>
+  <button id="drive">前进 3 秒</button>
+  <button id="sit">坐下 / 站起</button>
+  <button id="brain">🧠 大脑 on</button>
+  <div class="grid2">
+    <button data-skill="kick_left">左踢</button>
+    <button data-skill="kick_right">右踢</button>
+    <button data-skill="roulade">翻滚</button>
+    <button data-skill="ground_pick">捡起</button>
+  </div>
+  <button id="home">回家</button>
+  <button id="health">健康检查</button>
+  <pre id="healthbox"></pre>
+  <div class="yaw">
+    <label>转向 vyaw <span class="yawv" id="yawv">0.0</span></label>
+    <input id="yaw" type="range" min="-2" max="2" step="0.1" value="0">
+  </div>
+  <div id="hint">键盘（先点一下页面）<br>W 前进 · S 后退<br>A/D 原地转向（Shift 精细 ~10°）<br>W+A 行进转弯 · Q/E 方向盘渐增回正</div>
+  <div id="st"></div>
+</aside>
+<main><img src="/stream?follow={follow}"></main>
+<script>
+const $ = id => document.getElementById(id);
+async function refresh() {{
+  let r;
+  try {{ r = await (await fetch('/status')).json(); }}
+  catch (e) {{ $('st').textContent = 'server gone'; return; }}
+  $('pause').textContent = r.paused ? '▶ 继续渲染' : '⏸ 暂停渲染';
+  $('follow').textContent = r.follow ? '切到：定点' : '切到：跟随';
+  let s = r.paused ? '已暂停（省 CPU）' : '渲染中 ' + r.fps + ' fps';
+  s += '\\n相机：' + (r.follow ? '跟随鸭子' : '原点固定');
+  if (r.pos) {{
+    s += '\\n位置 (' + r.pos[0].toFixed(2) + ', ' + r.pos[1].toFixed(2) + ') m';
+    s += '\\n朝向 ' + r.pos[2].toFixed(0) + '°';
+  }}
+  if (r.odom && r.pos) {{
+    s += '\\n里程 (' + r.odom[0].toFixed(2) + ', ' + r.odom[1].toFixed(2) + ') '
+         + r.odom[2].toFixed(0) + '°';
+    s += '\\n里程误差 ' + Math.hypot(r.odom[0] - r.pos[0],
+                                     r.odom[1] - r.pos[1]).toFixed(2) + ' m';
+  }}
+  $('st').textContent = s;
+}}
+$('pause').onclick = async () => {{ await fetch('/toggle'); refresh(); }};
+$('follow').onclick = async () => {{
+  const on = $('follow').textContent.includes('跟随');
+  await fetch('/ctl/follow?on=' + (on ? '1' : '0')); refresh();
+}};
+$('drive').onclick = async () => {{ await fetch('/ctl/drive'); }};
+$('sit').onclick = async () => {{ await fetch('/ctl/sit'); }};
+$('brain').onclick = async () => {{
+  const turning_on = $('brain').textContent.includes('off');
+  const r = await (await fetch('/ctl/brain?on=' + (turning_on ? '1' : '0'))).json();
+  if (!r.ok) {{ alert(r.msg || 'robot.enable failed'); return; }}
+  $('brain').textContent = '🧠 大脑 ' + (turning_on ? 'on' : 'off');
+}};
+document.querySelectorAll('[data-skill]').forEach(b => {{
+  b.onclick = async () => {{
+    b.disabled = true;
+    const r = await (await fetch('/ctl/skill?name=' + b.dataset.skill)).json();
+    if (!r.ok) {{ alert(r.msg); b.disabled = false; return; }}
+    setTimeout(() => b.disabled = false, 5000);  // one-shots run 1-3 s
+  }};
+}});
+$('health').onclick = async () => {{
+  const box = $('healthbox');
+  if (box.style.display === 'block') {{ box.style.display = 'none'; return; }}
+  box.style.display = 'block';
+  box.textContent = '…';
+  box.textContent = (await (await fetch('/ctl/health')).json()).text;
+}};
+$('home').onclick = async () => {{
+  const r = await (await fetch('/ctl/home')).json();
+  if (r.ok) {{
+    $('home').disabled = true;
+    setTimeout(() => $('home').disabled = false, 60000);
+  }} else {{ alert(r.msg); }}
+}};
+// WASD + Q/E steering wheel + yaw slider: report what is held; the server
+// retransmits at 10 Hz and stops 0.7 s after updates go quiet (robotd's own
+// deadman is 500 ms). A/D spin in place (vyaw ±2, ~60 deg/s measured); held
+// with W/S they become forward/backward arcs. Q/E ramp the shared steer
+// value up like a steering wheel and spring it back on release; the slider
+// is a hand on the same wheel.
+const keys = {{ w: 0, s: 0, a: 0, d: 0, q: 0, e: 0 }};
+const yaw = $('yaw');
+let steer = 0;                                  // the one vyaw source
+let shift = false;                              // Shift+A/D = fine taps
+const STEER_MAX = 2.0, STEER_RATE = 0.25;       // per 100 ms — lock in 0.8 s
+const wheeling = () => keys.q || keys.e || Math.abs(steer) > 0.01;
+function held_cmd() {{
+  let vx = 0;
+  if (keys.w) vx += 0.5;
+  if (keys.s) vx -= 0.8;
+  let vyaw = steer;
+  const lock = shift ? 1.5 : 2.0;               // fine lock ~10 deg/tap
+  if (!wheeling()) {{
+    if (keys.a && !keys.d) vyaw = lock;
+    if (keys.d && !keys.a) vyaw = -lock;
+  }}
+  return {{ vx, vy: 0, vyaw }};
+}}
+let driving = false;
+function send_cmd() {{
+  const c = held_cmd();
+  driving = (c.vx !== 0 || c.vyaw !== 0);
+  fetch('/ctl/keys?vx=' + c.vx + '&vy=' + c.vy + '&vyaw=' + c.vyaw).catch(() => {{}});
+}}
+document.addEventListener('keydown', e => {{
+  const k = e.key.toLowerCase();
+  if (k === 'shift') {{ shift = true; send_cmd(); return; }}
+  if (k in keys) {{ keys[k] = 1; e.preventDefault(); send_cmd(); }}
+}});
+document.addEventListener('keyup', e => {{
+  const k = e.key.toLowerCase();
+  if (k === 'shift') {{ shift = false; send_cmd(); return; }}
+  if (k in keys) {{ keys[k] = 0; send_cmd(); }}
+}});
+setInterval(() => {{                            // the wheel itself
+  if (keys.q && !keys.e) steer = Math.min(STEER_MAX, steer + STEER_RATE);
+  else if (keys.e && !keys.q) steer = Math.max(-STEER_MAX, steer - STEER_RATE);
+  else if (steer > 0) steer = Math.max(0, steer - 4 * STEER_RATE);
+  else if (steer < 0) steer = Math.min(0, steer + 4 * STEER_RATE);
+  if (keys.q || keys.e || steer !== 0) {{
+    yaw.value = steer;                          // slider mirrors the wheel
+    $('yawv').textContent = steer.toFixed(1);
+    send_cmd();
+  }}
+}}, 100);
+yaw.addEventListener('input', () => {{          // a hand on the wheel directly
+  steer = parseFloat(yaw.value);
+  $('yawv').textContent = steer.toFixed(1);
+  send_cmd();
+}});
+yaw.addEventListener('change', () => {{         // released: spring back to zero
+  steer = 0;
+  yaw.value = 0;
+  $('yawv').textContent = '0.0';
+  send_cmd();
+}});
+setInterval(() => {{ if (driving) send_cmd(); }}, 250);  // keep-alive heartbeat
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body></html>
+"""
+
+
+def follow_from_path(path: str) -> bool:
+    return "follow=0" not in path and (
+        "follow=1" in path or "follow/" in path or path.endswith("follow")
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        global follow_duck, paused
+        if self.path.startswith("/status"):
+            with odom_lock:
+                odom = list(odom_pose) if odom_pose is not None else None
+            self._json({"paused": paused, "fps": FPS, "frames": frame_count,
+                        "follow": follow_duck, "pos": last_pose, "odom": odom})
+            return
+        if self.path.startswith("/toggle"):
+            paused = not paused
+            if paused:
+                paused_overlay()
+            print(f"planview: rendering {'paused' if paused else 'resumed'}", flush=True)
+            self._json({"paused": paused})
+            return
+        if self.path.startswith("/ctl/follow"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            on = q.get("on", ["0"])[0] == "1"
+            follow_duck = on
+            print(f"planview: camera follow {'on' if on else 'off'} (page button)", flush=True)
+            self._json({"follow": follow_duck})
+            return
+        if self.path.startswith("/ctl/drive"):
+            threading.Thread(target=drive_leg, daemon=True).start()
+            self._json({"ok": True})
+            return
+        if self.path.startswith("/ctl/sit"):
+            try:
+                reply = duck_rpc({"jsonrpc": "2.0", "id": 7, "method": "robot.do",
+                                  "params": {"skill": "sit_toggle"}}, wait=True)
+            except OSError as error:
+                reply = f"error: {error}"
+            print(f"planview: sit_toggle -> {reply}", flush=True)
+            self._json({"reply": reply})
+            return
+        if self.path.startswith("/ctl/brain"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            on = q.get("on", ["1"])[0] == "1"
+            try:
+                reply = duck_rpc({"jsonrpc": "2.0", "id": 11, "method": "robot.enable",
+                                  "params": {"on": on}}, wait=True)
+                ok, msg = True, str(reply)
+            except OSError as error:
+                ok, msg = False, str(error)
+            print(f"planview: brain {'on' if on else 'off'} -> {msg}", flush=True)
+            self._json({"ok": ok, "msg": msg})
+            return
+        if self.path.startswith("/ctl/keys"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                vx = float(q.get("vx", ["0"])[0])
+                vy = float(q.get("vy", ["0"])[0])
+                vyaw = float(q.get("vyaw", ["0"])[0])
+            except ValueError:
+                vx = vy = vyaw = 0.0
+            with kbd_lock:
+                kbd_state.update(vx=vx, vy=vy, vyaw=vyaw, ts=time.time())
+            self._json({"ok": True})
+            return
+        if self.path.startswith("/ctl/skill"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = q.get("name", [""])[0]
+            if name not in skill_list():
+                self._json({"ok": False, "msg": f"no skill named {name}"})
+                return
+            try:
+                reply = duck_rpc({"jsonrpc": "2.0", "id": 7, "method": "robot.do",
+                                  "params": {"skill": name}}, wait=True, timeout=8)
+            except OSError as error:
+                reply = f"error: {error}"
+            print(f"planview: skill {name} -> {reply}", flush=True)
+            self._json({"ok": True})
+            return
+        if self.path.startswith("/ctl/health"):
+            self._json({"text": ctl_health()})
+            return
+        if self.path.startswith("/ctl/home"):
+            ok, msg = start_home()
+            print(f"planview: home -> {msg}", flush=True)
+            self._json({"ok": ok, "msg": msg})
+            return
+        if self.path.startswith("/stream"):
+            want = follow_from_path(self.path)
+            if want != follow_duck:
+                follow_duck = want
+                print(f"planview: camera follow {'on' if want else 'off'} ({self.path})", flush=True)
+            self._stream()
+            return
+        # Anything else serves the page; its own URL's follow flag is passed
+        # through to the embedded stream.
+        follow = "1" if follow_from_path(self.path) else "0"
+        body = PAGE.format(follow=follow).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj: dict) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _stream(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+        boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        try:
+            while True:
+                with frame_lock:
+                    jpeg = latest_jpeg
+                if jpeg is not None:
+                    self.wfile.write(boundary + jpeg + b"\r\n")
+                    self.wfile.flush()
+                time.sleep(1.0 / FPS)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def log_message(self, *args):
+        pass
+
+
+threading.Thread(target=mirror_loop, daemon=True).start()
+print(f"planview: http://localhost:{HTTP_PORT}/ — Ctrl-C to stop", flush=True)
+ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
