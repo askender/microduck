@@ -33,15 +33,42 @@ list, probed once from a bogus name's refusal), and `/ctl/health` shells out
 to `robotctl health` with the sim's sockets; `/ctl/keys?vx=&vy=&vyaw=` carries the
 held-key state — a thread retransmits it at 10 Hz and goes idle 0.7 s after
 updates stop (robotd's 500 ms deadman then stops the duck). The key values
-are the measured dependable gaits: forward 0.5, backward -0.8 (small reverse
-commands engage nothing), A/D spin in place at vyaw ±2 (~60 deg/s, radius
+are the measured gaits: forward/reverse cruises (see below), A/D spin in
+place at vyaw ±2 (~60 deg/s, radius
 ~0.01 m — the angular channel is dead below |vyaw| ~1.5, measured 2026-09-28,
 /tmp/turn_sweep.py); held with W/S they become arcs (W+A walks 0.20 m/s at
 R ≈ 0.2 m). A tap is one turning step, ~25-30 deg — the floor however brief
 the tap — and Shift+A/D are fine taps at ±1.5 (~10 deg each, occasionally
-not entraining at the threshold edge; tap again). Raw strafe is not offered —
-the policy answers vy by drifting
-and yawing. Q/E is a steering wheel: vyaw ramps up 0.25 per 100 ms while
+not entraining at the threshold edge; tap again). Up/Down nudge the cruise
+speed in 0.05 steps — the forward cruise (the vx W sends, [0.3, 1.2],
+default 0.5) normally, the reverse cruise (|vx| S sends, [0.5, 1.2],
+default 0.8) while S is held; key-repeat ramps, and a change lands
+mid-drive. Range ends are the measured envelope (2026-09-30,
+/tmp/envelope_sweep.py): commanded forward 0.1/0.2 do not walk at all (the
+gait engages only from 0.3); 1.2 is the dependable ceiling (survives
+repeats, v_eff 0.53-0.56 m/s), 1.3 is a coin-flip (fell 1/2), 1.4 falls
+(2/2), 1.5 lands face-down (roulade rights it). Reverse engages already at
+0.5 (-0.20 m/s — the old "reverse needs 0.8" note was wrong); 1.2 is its
+best (-0.46 m/s, dyaw -7 deg over 6 s); from 1.5 the gait collapses to
+yawing in place and 2.5 falls. Uncompensated, forward speeds arc right —
+worst ~16 deg/s around commanded 0.7, near-straight again at 1.2. X toggles
+直线 (straight) compensation, default on: a per-speed counter-vyaw added
+whenever W is held with no steering input — +0.18/+0.22/+0.44 at
+vx 0.3/0.4/0.5 (residual within ±3 deg/s, lateral deviation 2-6% of
+distance vs 14-25% uncompensated) and +0.30..+0.10 over 0.6..1.2 (residual
+within ±5 deg/s, single-run anchors, /tmp/comp_high.py) — linear between
+anchors, so the COMP table covers every 0.05 step in [0.3, 1.2]. Reverse
+gets no compensation (uncalibrated). Small vyaw while walking steers
+smoothly at ~40 deg/s per 1.0 vyaw — the turn dead zone below |vyaw| ~1.5
+applies only to pure-spin commands (measured 2026-09-30,
+/tmp/speed_test.py, straight_recipe.py, straight_fine.py,
+straight_recheck.py). Raw strafe is not offered:
+the v5 velstand policy was trained with the vy command slot hard-zeroed
+(protective_fall, exported 2026-09-14), so in-range vy (±0.3) moves nothing
+and over-range vy drifts and yaws (/tmp/vy_sweep.py, 2026-09-30); the RL
+repo's current develop trains vy ±0.3, so a policy re-exported from it
+would strafe — wire <- -> then. Q/E is a steering wheel: vyaw ramps up
+0.25 per 100 ms while
 held (full lock ±2 in 0.8 s) and springs back four times faster on release.
 The slider sets the same vyaw directly and mirrors the wheel. Paused, the mirror
 thread idles and the last frame keeps being served — the picture freezes
@@ -227,9 +254,8 @@ home_proc = None
 # Held-key drive state. The page reports what is held (W/S/A/D + the yaw
 # slider) and a thread here retransmits robot.move at 10 Hz for as long as
 # updates stay fresh — robotd's 500 ms deadman drops motion after the last
-# command, so updates going quiet IS the stop signal. Values are the measured
-# dependable gaits: forward 0.5, backward -0.8 (small backward commands do
-# nothing — the policy needs |vx| ~0.8 to engage reverse), arcs need some vx.
+# command, so updates going quiet IS the stop signal. Values come from the
+# page (cruises and steering live there); arcs need some vx.
 kbd_lock = threading.Lock()
 kbd_state = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "ts": 0.0}
 KBD_FRESH = 0.7  # s without an update before the emitter goes idle
@@ -537,7 +563,7 @@ PAGE = """<!doctype html>
     <label>转向 vyaw <span class="yawv" id="yawv">0.0</span></label>
     <input id="yaw" type="range" min="-2" max="2" step="0.1" value="0">
   </div>
-  <div id="hint">键盘（先点一下页面）<br>W 前进 · S 后退<br>A/D 原地转向（Shift 精细 ~10°）<br>W+A 行进转弯 · Q/E 方向盘渐增回正<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
+  <div id="hint">键盘（先点一下页面）<br>W 前进 <span class="yawv" id="cruisev">0.50</span> · S 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 S 调后退）<br>A/D 原地转向（Shift 精细 ~10°）<br>W+A 行进转弯 · Q/E 方向盘渐增回正<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
 <main><img src="/stream?follow={follow}"></main>
@@ -641,18 +667,43 @@ const keys = {{ w: 0, s: 0, a: 0, d: 0, q: 0, e: 0 }};
 const yaw = $('yaw');
 let steer = 0;                                  // the one vyaw source
 let shift = false;                              // Shift+A/D = fine taps
+let cruise = 0.5;                               // the vx W sends (Up/Down)
+let rev = 0.8;                                  // |vx| S sends (Up/Down while S held)
+const CRUISE_MIN = 0.3, CRUISE_MAX = 1.2, CRUISE_STEP = 0.05;
+const REV_MIN = 0.5, REV_MAX = 1.2;
+// 直线 compensation: the counter-vyaw that cancels the v5 policy's
+// speed-dependent rightward arc (measured 2026-09-30, /tmp/straight_*.py +
+// comp_high.py). Anchors at every second 0.05 step, linear between; covers
+// the whole forward cruise range [0.3, 1.2]. Forward only.
+let straight = true;                            // X toggles
+const COMP = [
+  [0.3, 0.18], [0.35, 0.2], [0.4, 0.22], [0.45, 0.33], [0.5, 0.44],
+  [0.55, 0.37], [0.6, 0.3], [0.65, 0.35], [0.7, 0.4], [0.75, 0.33],
+  [0.8, 0.25], [0.85, 0.3], [0.9, 0.35], [0.95, 0.35], [1.0, 0.35],
+  [1.05, 0.28], [1.1, 0.2], [1.15, 0.15], [1.2, 0.1]];
+function comp(v) {{
+  if (v < COMP[0][0]) return 0;
+  for (let i = 0; i < COMP.length - 1; i++) {{
+    const a = COMP[i], b = COMP[i + 1];
+    if (v <= b[0]) return a[1] + (b[1] - a[1]) * (v - a[0]) / (b[0] - a[0]);
+  }}
+  return COMP[COMP.length - 1][1];
+}}
 const STEER_MAX = 2.0, STEER_RATE = 0.25;       // per 100 ms — lock in 0.8 s
 const wheeling = () => keys.q || keys.e || Math.abs(steer) > 0.01;
 function held_cmd() {{
   let vx = 0;
-  if (keys.w) vx += 0.5;
-  if (keys.s) vx -= 0.8;
+  if (keys.w) vx += cruise;
+  if (keys.s) vx -= rev;
   let vyaw = steer;
   const lock = shift ? 1.5 : 2.0;               // fine lock ~10 deg/tap
   if (!wheeling()) {{
     if (keys.a && !keys.d) vyaw = lock;
     if (keys.d && !keys.a) vyaw = -lock;
   }}
+  // Straight compensation only when nothing else steers — A/D, Q/E and the
+  // slider stay pure manual input.
+  if (straight && keys.w && !keys.s && vyaw === 0) vyaw = comp(cruise);
   return {{ vx, vy: 0, vyaw }};
 }}
 let driving = false;
@@ -664,6 +715,26 @@ function send_cmd() {{
 document.addEventListener('keydown', e => {{
   const k = e.key.toLowerCase();
   if (k === 'shift') {{ shift = true; send_cmd(); return; }}
+  if (k === 'x' && !e.repeat) {{
+    straight = !straight;
+    $('strv').textContent = straight ? '开' : '关';
+    send_cmd();
+    return;
+  }}
+  if (k === 'arrowup' || k === 'arrowdown') {{
+    // cruise control: adjust whichever direction is held — the forward cruise
+    // (W) normally, the reverse cruise (S) while S alone is held.
+    const d = k === 'arrowup' ? CRUISE_STEP : -CRUISE_STEP;
+    if (keys.s && !keys.w) {{
+      rev = Math.min(REV_MAX, Math.max(REV_MIN, rev + d));
+      $('revv').textContent = rev.toFixed(2);
+    }} else {{
+      cruise = Math.min(CRUISE_MAX, Math.max(CRUISE_MIN, cruise + d));
+      $('cruisev').textContent = cruise.toFixed(2);
+    }}
+    e.preventDefault(); send_cmd();
+    return;
+  }}
   if (k in keys) {{ keys[k] = 1; e.preventDefault(); send_cmd(); }}
 }});
 document.addEventListener('keyup', e => {{
@@ -694,6 +765,8 @@ yaw.addEventListener('change', () => {{         // released: spring back to zero
   send_cmd();
 }});
 setInterval(() => {{ if (driving) send_cmd(); }}, 250);  // keep-alive heartbeat
+$('cruiserange').textContent = '前进 ' + CRUISE_MIN.toFixed(2) + '–' + CRUISE_MAX.toFixed(2)
+  + ' / 后退 ' + REV_MIN.toFixed(2) + '–' + REV_MAX.toFixed(2);
 refresh();
 setInterval(refresh, 1000);
 </script>
