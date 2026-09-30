@@ -41,16 +41,18 @@ R ≈ 0.2 m). A tap is one turning step, ~25-30 deg — the floor however brief
 the tap — and Shift+A/D are fine taps at ±1.5 (~10 deg each, occasionally
 not entraining at the threshold edge; tap again). Up/Down nudge the cruise
 speed in 0.05 steps — the forward cruise (the vx W sends, [0.3, 1.2],
-default 0.5) normally, the reverse cruise (|vx| S sends, [0.5, 1.2],
+default 0.5) normally, the reverse cruise (|vx| S sends, [0.4, 1.2],
 default 0.8) while S is held; key-repeat ramps, and a change lands
 mid-drive. Range ends are the measured envelope (2026-09-30,
-/tmp/envelope_sweep.py): commanded forward 0.1/0.2 do not walk at all (the
-gait engages only from 0.3); 1.2 is the dependable ceiling (survives
-repeats, v_eff 0.53-0.56 m/s), 1.3 is a coin-flip (fell 1/2), 1.4 falls
-(2/2), 1.5 lands face-down (roulade rights it). Reverse engages already at
-0.5 (-0.20 m/s — the old "reverse needs 0.8" note was wrong); 1.2 is its
-best (-0.46 m/s, dyaw -7 deg over 6 s); from 1.5 the gait collapses to
-yawing in place and 2.5 falls. Uncompensated, forward speeds arc right —
+/tmp/envelope_sweep.py + range_extend2.py + rev_floor.py): commanded
+forward 0.1/0.2 do not walk at all (the gait engages only from 0.3); 1.2
+is the dependable ceiling (survives repeats, v_eff 0.53-0.56 m/s), 1.3 is
+a coin-flip (fell 1/2 standing start, and ramping 1.2 -> 1.3 mid-drive
+gave only 0.15 m/s), 1.4 falls (2/2 standing start; ramped 0.42 m/s but
+with falls at stop), 1.5 lands face-down (roulade rights it). Reverse
+engages at 0.4 (-0.17 m/s, stops clean x2 — 0.2/0.3 stand still); 1.2 is
+its best (-0.46 m/s, dyaw -7 deg over 6 s); from 1.5 the gait collapses
+to yawing in place and 2.5 falls. Uncompensated, forward speeds arc right —
 worst ~16 deg/s around commanded 0.7, near-straight again at 1.2. X toggles
 直线 (straight) compensation, default on: a per-speed counter-vyaw added
 whenever W is held with no steering input — +0.18/+0.22/+0.44 at
@@ -670,7 +672,7 @@ let shift = false;                              // Shift+A/D = fine taps
 let cruise = 0.5;                               // the vx W sends (Up/Down)
 let rev = 0.8;                                  // |vx| S sends (Up/Down while S held)
 const CRUISE_MIN = 0.3, CRUISE_MAX = 1.2, CRUISE_STEP = 0.05;
-const REV_MIN = 0.5, REV_MAX = 1.2;
+const REV_MIN = 0.4, REV_MAX = 1.2;
 // 直线 compensation: the counter-vyaw that cancels the v5 policy's
 // speed-dependent rightward arc (measured 2026-09-30, /tmp/straight_*.py +
 // comp_high.py). Anchors at every second 0.05 step, linear between; covers
