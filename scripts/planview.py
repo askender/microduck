@@ -40,7 +40,10 @@ trained sampling ranges; beyond them tracking is untrained). The head intent
 has NO deadman — one call holds until the next — and the walking policy tracks
 it as part of its observation, so the head moves while walking. Tracking is a
 learned posture, not a servo write: yaw is tight (±0.05), pitch/neck loose and
-cross-coupled (measured 2026-10-01, /tmp/head_test.py). The key values
+cross-coupled (measured 2026-10-01, /tmp/head_test.py). `/ctl/headswing`
+toggles server-side 10 Hz sines (摇头 yaw ±40°, 点头 pitch ±25°, 2 s period,
+both axes may run at once) — same no-deadman rule, so the emitter sends
+continuously; any page departure (bye) stops it. The key values
 are the measured gaits: forward/reverse cruises (see below), J/L spin in
 place at vyaw ±2 (~60 deg/s, radius
 ~0.01 m — the angular channel is dead below |vyaw| ~1.5, measured 2026-09-28,
@@ -276,6 +279,38 @@ home_proc = None
 kbd_lock = threading.Lock()
 kbd_state = {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "ts": 0.0}
 KBD_FRESH = 0.7  # s without an update before the emitter goes idle
+
+# Head swing (摇头/点头): a 10 Hz emitter traces slow sines on the head
+# axes through robot.head — both axes may run at once, combined into one
+# call. The head intent has no deadman, so it must keep sending while on;
+# the slot is separate from the twist, so the swing rides alongside walking.
+# Zero phase at each enable, so toggling on never jumps.
+swing_lock = threading.Lock()
+swing_axes = {}  # axis -> enable time ({"yaw": t0, ...}); absent = off
+SWING_PERIOD_S = 2.0
+SWING_AMP_DEG = {"yaw": 40.0, "pitch": 25.0}
+
+
+def head_swing_emitter() -> None:
+    while True:
+        with swing_lock:
+            axes = dict(swing_axes)
+        if axes:
+            params = {"neck_pitch": 0.0, "head_pitch": 0.0,
+                      "head_yaw": 0.0, "head_roll": 0.0}
+            for axis, t0 in axes.items():
+                phase = 2 * math.pi * (time.time() - t0) / SWING_PERIOD_S
+                params["head_" + axis] = math.radians(
+                    SWING_AMP_DEG[axis] * math.sin(phase))
+            try:
+                duck_rpc({"jsonrpc": "2.0", "method": "robot.head",
+                          "params": params})
+            except OSError:
+                pass
+        time.sleep(0.1)
+
+
+threading.Thread(target=head_swing_emitter, daemon=True).start()
 
 
 def kbd_emitter() -> None:
@@ -590,9 +625,13 @@ PAGE = """<!doctype html>
     <input id="hyaw" type="range" min="-80" max="80" step="1" value="0">
     <label>头侧倾 <span class="yawv" id="vhr">0°</span></label>
     <input id="hroll" type="range" min="-18" max="18" step="1" value="0">
+    <div class="grid2">
+      <button id="swingy">摇头</button>
+      <button id="swingp">点头</button>
+    </div>
     <button id="headhome">头部归位</button>
   </div>
-  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
+  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>摇头/点头：2 s 周期正弦摆动（摇头 ±40°、点头 ±25°），可同开；再按一次停，动滑杆全停<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
 <main><img src="/stream?follow={follow}"></main>
@@ -633,6 +672,8 @@ async function refresh() {{
     else if (r.gate.starved) s += '\\n心跳 断供中 — 板子已停车';
     else s += '\\n心跳 喂养中（' + Math.max(0, Math.round(r.gate.timeout_s - r.gate.age_s)) + 's 后停车）';
   }}
+  swinging = new Set(r.swing || []);             // resync after a page reload
+  swingUI();
   $('st').textContent = s;
 }}
 $('pause').onclick = async () => {{ await fetch('/toggle'); refresh(); }};
@@ -826,8 +867,30 @@ function sendHead() {{
 headSliders.forEach(id => $(id).addEventListener('input', sendHead));
 $('headhome').onclick = () => {{
   headSliders.forEach(id => $(id).value = 0);
-  sendHead();
+  if (swinging) setSwing(null); else sendHead();
 }};
+
+// 摇头/点头: the server traces the sines (both axes may run at once); the
+// buttons toggle independently. Moving any slider stops both
+// (setSwing(null) re-sends the slider pose).
+let swinging = new Set();
+function swingUI() {{
+  $('swingy').textContent = swinging.has('yaw') ? '摇头：开' : '摇头';
+  $('swingp').textContent = swinging.has('pitch') ? '点头：开' : '点头';
+}}
+async function setSwing(axis) {{
+  await fetch('/ctl/headswing?axis=' + (axis || 'off')).catch(() => {{}});
+  if (axis) {{
+    if (swinging.has(axis)) swinging.delete(axis); else swinging.add(axis);
+  }} else swinging.clear();
+  swingUI();
+  if (!swinging.size) sendHead();
+}}
+$('swingy').onclick = () => setSwing('yaw');
+$('swingp').onclick = () => setSwing('pitch');
+headSliders.forEach(id => $(id).addEventListener('input', () => {{
+  if (swinging.size) setSwing(null);
+}}));
 setInterval(() => {{ if (driving) send_cmd(); }}, 250);  // keep-alive heartbeat
 // The WASD compass loop. 150 ms ticks: aim from the freshest ground truth
 // (/status pos, updated at render rate), spin toward the screen direction
@@ -876,17 +939,20 @@ def follow_from_path(path: str) -> bool:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global follow_duck, paused, iso_view
+        global follow_duck, paused, iso_view, swing_axes
         if self.path.startswith("/status"):
             with odom_lock:
                 odom = list(odom_pose) if odom_pose is not None else None
                 brain, hz = brain_policy, loop_hz
                 brain_age = time.time() - state_ts if state_ts else None
+            with swing_lock:
+                swing = sorted(swing_axes)
             self._json({"paused": paused, "fps": FPS, "frames": frame_count,
                         "follow": follow_duck, "iso": iso_view,
                         "pos": last_pose, "odom": odom,
                         "brain": brain, "brain_age": brain_age, "loop_hz": hz,
-                        "gate": self._gate(beat=False), "viewers": viewers})
+                        "gate": self._gate(beat=False), "viewers": viewers,
+                        "swing": swing})
             return
         if self.path.startswith("/toggle"):
             paused = not paused
@@ -951,6 +1017,24 @@ class Handler(BaseHTTPRequestHandler):
             with kbd_lock:
                 kbd_state.update(vx=vx, vy=vy, vyaw=vyaw, ts=time.time())
             self._json({"ok": True})
+            return
+        if self.path.startswith("/ctl/headswing"):
+            # must precede /ctl/head — "headswing" starts with "head".
+            # Each axis toggles independently; "off" clears both.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            axis = q.get("axis", ["off"])[0]
+            with swing_lock:
+                if axis in ("yaw", "pitch"):
+                    if axis in swing_axes:
+                        del swing_axes[axis]
+                    else:
+                        swing_axes[axis] = time.time()
+                    active = sorted(swing_axes)
+                else:
+                    swing_axes.clear()
+                    active = []
+            print(f"planview: head swing {axis} -> {active}", flush=True)
+            self._json({"on": bool(active), "axis": axis, "active": active})
             return
         if self.path.startswith("/ctl/head"):
             # robot.head carries 4 head-joint deltas from the home pose,
@@ -1046,6 +1130,8 @@ class Handler(BaseHTTPRequestHandler):
         # The page's farewell, sent when the tab hides or closes: turn the
         # brain off gracefully while the link is still up — the duck walks to
         # its home pose — and let the gate cut the link on its own schedule.
+        with swing_lock:
+            swing_axes.clear()
         try:
             reply = duck_rpc({"jsonrpc": "2.0", "id": 12, "method": "robot.enable",
                               "params": {"on": False}}, wait=True)
