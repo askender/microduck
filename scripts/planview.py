@@ -22,7 +22,7 @@ so it stays correct in both modes.
 Endpoints: `/` serves a small control page — sidebar buttons for every
 control that already exists (pause/resume rendering, camera follow on/off,
 walk forward 3 s, sit/stand toggle, walk home, the one-shot skills, health),
-plus WASD keyboard drive and a yaw slider; the stream fills the viewport
+plus IJKL keyboard drive and a yaw slider; the stream fills the viewport
 beside them, no scrolling.
 `/stream` is the MJPEG feed (the follow flag lives here); `/toggle` flips
 rendering on and off; `/status` reports state as JSON, including the duck's
@@ -34,12 +34,12 @@ list, probed once from a bogus name's refusal), and `/ctl/health` shells out
 to `robotctl health` with the sim's sockets; `/ctl/keys?vx=&vy=&vyaw=` carries the
 held-key state — a thread retransmits it at 10 Hz and goes idle 0.7 s after
 updates stop (robotd's 500 ms deadman then stops the duck). The key values
-are the measured gaits: forward/reverse cruises (see below), A/D spin in
+are the measured gaits: forward/reverse cruises (see below), J/L spin in
 place at vyaw ±2 (~60 deg/s, radius
 ~0.01 m — the angular channel is dead below |vyaw| ~1.5, measured 2026-09-28,
-/tmp/turn_sweep.py); held with W/S they become arcs (W+A walks 0.20 m/s at
+/tmp/turn_sweep.py); held with I/K they become arcs (I+J walks 0.20 m/s at
 R ≈ 0.2 m). A tap is one turning step, ~25-30 deg — the floor however brief
-the tap — and Shift+A/D are fine taps at ±1.5 (~10 deg each, occasionally
+the tap — and Shift+J/L are fine taps at ±1.5 (~10 deg each, occasionally
 not entraining at the threshold edge; tap again). Up/Down nudge the cruise
 speed in 0.05 steps — the forward cruise (the vx W sends, [0.3, 1.2],
 default 0.5) normally, the reverse cruise (|vx| S sends, [0.4, 1.2],
@@ -70,9 +70,14 @@ the v5 velstand policy was trained with the vy command slot hard-zeroed
 (protective_fall, exported 2026-09-14), so in-range vy (±0.3) moves nothing
 and over-range vy drifts and yaws (/tmp/vy_sweep.py, 2026-09-30); the RL
 repo's current develop trains vy ±0.3, so a policy re-exported from it
-would strafe — wire <- -> then. Q/E is a steering wheel: vyaw ramps up
+would strafe — wire <- -> then. U/O is a steering wheel: vyaw ramps up
 0.25 per 100 ms while
 held (full lock ±2 in 0.8 s) and springs back four times faster on release.
+WASD is a screen-relative compass (added 2026-10-01): hold one and the page
+turns the duck to face that SCREEN direction (up/left/down/right, remapped
+per view — world yaw = camera azimuth +0/-90/180/+90; az 90 top, 45
+oblique) and then cruises forward with a proportional heading hold,
+re-aiming from ground truth every 150 ms. IJKL stay body-frame.
 The slider sets the same vyaw directly and mirrors the wheel. Paused, the mirror
 thread idles and the last frame keeps being served — the picture freezes
 instead of going black, stamped PAUSED. Same when nobody is watching: the
@@ -256,7 +261,7 @@ def drive_leg():
 home_proc = None
 
 
-# Held-key drive state. The page reports what is held (W/S/A/D + the yaw
+# Held-key drive state. The page reports what is held (IJKL + the yaw
 # slider) and a thread here retransmits robot.move at 10 Hz for as long as
 # updates stay fresh — robotd's 500 ms deadman drops motion after the last
 # command, so updates going quiet IS the stop signal. Values come from the
@@ -568,7 +573,7 @@ PAGE = """<!doctype html>
     <label>转向 vyaw <span class="yawv" id="yawv">0.0</span></label>
     <input id="yaw" type="range" min="-2" max="2" step="0.1" value="0">
   </div>
-  <div id="hint">键盘（先点一下页面）<br>W 前进 <span class="yawv" id="cruisev">0.50</span> · S 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 S 调后退）<br>A/D 原地转向（Shift 精细 ~10°）<br>W+A 行进转弯 · Q/E 方向盘渐增回正<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
+  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
 <main><img src="/stream?follow={follow}"></main>
@@ -578,6 +583,7 @@ async function refresh() {{
   let r;
   try {{ r = await (await fetch('/status')).json(); }}
   catch (e) {{ $('st').textContent = 'server gone'; return; }}
+  viewIso = !!r.iso;
   $('pause').textContent = r.paused ? '▶ 继续渲染' : '⏸ 暂停渲染';
   $('follow').textContent = r.follow ? '切到：定点' : '切到：跟随';
   $('view').textContent = r.iso ? '切到：俯视' : '切到：斜视';
@@ -662,16 +668,26 @@ $('home').onclick = async () => {{
     setTimeout(() => $('home').disabled = false, 60000);
   }} else {{ alert(r.msg); }}
 }};
-// WASD + Q/E steering wheel + yaw slider: report what is held; the server
+// IJKL + U/O steering wheel + yaw slider: report what is held; the server
 // retransmits at 10 Hz and stops 0.7 s after updates go quiet (robotd's own
-// deadman is 500 ms). A/D spin in place (vyaw ±2, ~60 deg/s measured); held
-// with W/S they become forward/backward arcs. Q/E ramp the shared steer
+// deadman is 500 ms). J/L spin in place (vyaw ±2, ~60 deg/s measured); held
+// with I/K they become forward/backward arcs. U/O ramp the shared steer
 // value up like a steering wheel and spring it back on release; the slider
 // is a hand on the same wheel.
-const keys = {{ w: 0, s: 0, a: 0, d: 0, q: 0, e: 0 }};
+const keys = {{ i: 0, k: 0, j: 0, l: 0, u: 0, o: 0 }};
+// WASD compass drive: walk toward SCREEN up/left/down/right — turn to face
+// the screen direction first, then cruise forward. IJKL above are body-frame
+// (tank controls); these are world-frame, recomputed per view: the camera
+// azimuth is 90 deg in the top view (screen up = world +y) and 45 deg in the
+// oblique (screen up = the +x+y diagonal), so screen up = az deg, right =
+// az-90, down = az+180, left = az+90 in world yaw. viewIso is refreshed from
+// /status every second.
+const dirKeys = {{ w: 0, a: 0, s: 0, d: 0 }};
+let lastDir = null;                             // most recent WASD press
+let viewIso = true;
 const yaw = $('yaw');
 let steer = 0;                                  // the one vyaw source
-let shift = false;                              // Shift+A/D = fine taps
+let shift = false;                              // Shift+J/L = fine taps
 let cruise = 0.5;                               // the vx W sends (Up/Down)
 let rev = 0.8;                                  // |vx| S sends (Up/Down while S held)
 const CRUISE_MIN = 0.3, CRUISE_MAX = 1.2, CRUISE_STEP = 0.05;
@@ -695,20 +711,20 @@ function comp(v) {{
   return COMP[COMP.length - 1][1];
 }}
 const STEER_MAX = 2.0, STEER_RATE = 0.25;       // per 100 ms — lock in 0.8 s
-const wheeling = () => keys.q || keys.e || Math.abs(steer) > 0.01;
+const wheeling = () => keys.u || keys.o || Math.abs(steer) > 0.01;
 function held_cmd() {{
   let vx = 0;
-  if (keys.w) vx += cruise;
-  if (keys.s) vx -= rev;
+  if (keys.i) vx += cruise;
+  if (keys.k) vx -= rev;
   let vyaw = steer;
   const lock = shift ? 1.5 : 2.0;               // fine lock ~10 deg/tap
   if (!wheeling()) {{
-    if (keys.a && !keys.d) vyaw = lock;
-    if (keys.d && !keys.a) vyaw = -lock;
+    if (keys.j && !keys.l) vyaw = lock;
+    if (keys.l && !keys.j) vyaw = -lock;
   }}
-  // Straight compensation only when nothing else steers — A/D, Q/E and the
+  // Straight compensation only when nothing else steers — J/L, U/O and the
   // slider stay pure manual input.
-  if (straight && keys.w && !keys.s && vyaw === 0) vyaw = comp(cruise);
+  if (straight && keys.i && !keys.k && vyaw === 0) vyaw = comp(cruise);
   return {{ vx, vy: 0, vyaw }};
 }}
 let driving = false;
@@ -730,7 +746,7 @@ document.addEventListener('keydown', e => {{
     // cruise control: adjust whichever direction is held — the forward cruise
     // (W) normally, the reverse cruise (S) while S alone is held.
     const d = k === 'arrowup' ? CRUISE_STEP : -CRUISE_STEP;
-    if (keys.s && !keys.w) {{
+    if (keys.k && !keys.i) {{
       rev = Math.min(REV_MAX, Math.max(REV_MIN, rev + d));
       $('revv').textContent = rev.toFixed(2);
     }} else {{
@@ -740,19 +756,26 @@ document.addEventListener('keydown', e => {{
     e.preventDefault(); send_cmd();
     return;
   }}
+  if (k in dirKeys) {{ dirKeys[k] = 1; lastDir = k; e.preventDefault(); return; }}
   if (k in keys) {{ keys[k] = 1; e.preventDefault(); send_cmd(); }}
 }});
 document.addEventListener('keyup', e => {{
   const k = e.key.toLowerCase();
   if (k === 'shift') {{ shift = false; send_cmd(); return; }}
+  if (k in dirKeys) {{
+    dirKeys[k] = 0;
+    if (lastDir === k) lastDir = ['w', 'a', 's', 'd'].find(x => dirKeys[x]) || null;
+    if (!lastDir) fetch('/ctl/keys?vx=0&vy=0&vyaw=0').catch(() => {{}});
+    return;
+  }}
   if (k in keys) {{ keys[k] = 0; send_cmd(); }}
 }});
 setInterval(() => {{                            // the wheel itself
-  if (keys.q && !keys.e) steer = Math.min(STEER_MAX, steer + STEER_RATE);
-  else if (keys.e && !keys.q) steer = Math.max(-STEER_MAX, steer - STEER_RATE);
+  if (keys.u && !keys.o) steer = Math.min(STEER_MAX, steer + STEER_RATE);
+  else if (keys.o && !keys.u) steer = Math.max(-STEER_MAX, steer - STEER_RATE);
   else if (steer > 0) steer = Math.max(0, steer - 4 * STEER_RATE);
   else if (steer < 0) steer = Math.min(0, steer + 4 * STEER_RATE);
-  if (keys.q || keys.e || steer !== 0) {{
+  if (keys.u || keys.o || steer !== 0) {{
     yaw.value = steer;                          // slider mirrors the wheel
     $('yawv').textContent = steer.toFixed(1);
     send_cmd();
@@ -770,6 +793,36 @@ yaw.addEventListener('change', () => {{         // released: spring back to zero
   send_cmd();
 }});
 setInterval(() => {{ if (driving) send_cmd(); }}, 250);  // keep-alive heartbeat
+// The WASD compass loop. 150 ms ticks: aim from the freshest ground truth
+// (/status pos, updated at render rate), spin toward the screen direction
+// past 15 deg of error, then cruise with a proportional heading hold
+// (walking small-vyaw gain is ~40 deg/s per 1.0). Holding two of WASD+IJKL
+// at once lets the two emitters interleave — last writer wins per tick.
+let compassBusy = false;
+setInterval(async () => {{
+  const az = viewIso ? 45 : 90;
+  const offs = {{ w: 0, a: 90, s: 180, d: -90 }};
+  const held = lastDir && dirKeys[lastDir] ? lastDir
+             : ['w', 'a', 's', 'd'].find(x => dirKeys[x]);
+  if (!held || compassBusy) return;
+  compassBusy = true;
+  try {{
+    const r = await (await fetch('/status')).json();
+    if (!r.pos) return;                       // no ground truth — cannot aim
+    const err = ((az + offs[held] - r.pos[2]) % 360 + 540) % 360 - 180;
+    let vx = 0, vyaw = 0;
+    if (Math.abs(err) > 15) {{
+      vyaw = err > 0 ? 2.0 : -2.0;            // spin toward the direction
+    }} else {{
+      vx = cruise;                            // walk it, holding heading
+      // comp() pre-cancels the gait's rightward arc so err*0.06 is purely
+      // corrective (without it the hold fights the arc and holds ~13 deg).
+      vyaw = Math.max(-2, Math.min(2, comp(cruise) + err * 0.06));
+    }}
+    fetch('/ctl/keys?vx=' + vx + '&vy=0&vyaw=' + vyaw).catch(() => {{}});
+  }} catch (e) {{}}
+  finally {{ compassBusy = false; }}
+}}, 150);
 $('cruiserange').textContent = '前进 ' + CRUISE_MIN.toFixed(2) + '–' + CRUISE_MAX.toFixed(2)
   + ' / 后退 ' + REV_MIN.toFixed(2) + '–' + REV_MAX.toFixed(2);
 refresh();
