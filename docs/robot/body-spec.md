@@ -10,6 +10,10 @@ real duck's hardware is close but not identical.
 Reproduce everything below with a MuJoCo `MjModel` and a socket to the body
 server's `read` op — the snippets are at the end.
 
+A Chinese translation lives at [body-spec.zh.md](body-spec.zh.md) — a
+courtesy copy; this page owns the mechanism, and when the two disagree this
+is the one to fix.
+
 ## Mass budget
 
 The duck is **737.2 g** across 15 bodies and 81 geoms (the loaded scene adds
