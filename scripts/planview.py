@@ -33,7 +33,14 @@ kick_left, kick_right, ground_pick — whitelisted against the live skill
 list, probed once from a bogus name's refusal), and `/ctl/health` shells out
 to `robotctl health` with the sim's sockets; `/ctl/keys?vx=&vy=&vyaw=` carries the
 held-key state — a thread retransmits it at 10 Hz and goes idle 0.7 s after
-updates stop (robotd's 500 ms deadman then stops the duck). The key values
+updates stop (robotd's 500 ms deadman then stops the duck). `/ctl/head` sends
+`robot.head`: four head-joint deltas from the home pose, radians on the wire,
+degrees in the query (neck/pitch clamp ±1.1, yaw ±1.4, roll ±0.31 — the
+trained sampling ranges; beyond them tracking is untrained). The head intent
+has NO deadman — one call holds until the next — and the walking policy tracks
+it as part of its observation, so the head moves while walking. Tracking is a
+learned posture, not a servo write: yaw is tight (±0.05), pitch/neck loose and
+cross-coupled (measured 2026-10-01, /tmp/head_test.py). The key values
 are the measured gaits: forward/reverse cruises (see below), J/L spin in
 place at vyaw ±2 (~60 deg/s, radius
 ~0.01 m — the angular channel is dead below |vyaw| ~1.5, measured 2026-09-28,
@@ -573,7 +580,19 @@ PAGE = """<!doctype html>
     <label>转向 vyaw <span class="yawv" id="yawv">0.0</span></label>
     <input id="yaw" type="range" min="-2" max="2" step="0.1" value="0">
   </div>
-  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
+  <div class="yaw">
+    <label>头部（°，0 = 归位姿态；正俯仰 = 低头）</label>
+    <label>颈俯仰 <span class="yawv" id="vneck">0°</span></label>
+    <input id="hneck" type="range" min="-63" max="63" step="1" value="0">
+    <label>头俯仰 <span class="yawv" id="vhp">0°</span></label>
+    <input id="hpitch" type="range" min="-63" max="63" step="1" value="0">
+    <label>头偏转 <span class="yawv" id="vhy">0°</span></label>
+    <input id="hyaw" type="range" min="-80" max="80" step="1" value="0">
+    <label>头侧倾 <span class="yawv" id="vhr">0°</span></label>
+    <input id="hroll" type="range" min="-18" max="18" step="1" value="0">
+    <button id="headhome">头部归位</button>
+  </div>
+  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
 <main><img src="/stream?follow={follow}"></main>
@@ -792,6 +811,23 @@ yaw.addEventListener('change', () => {{         // released: spring back to zero
   $('yawv').textContent = '0.0';
   send_cmd();
 }});
+
+// Head sliders: degrees, 0 = home pose. robot.head has no deadman, so one
+// fetch per input event holds; the server clamps to the trained deltas.
+const headSliders = ['hneck', 'hpitch', 'hyaw', 'hroll'];
+function sendHead() {{
+  $('vneck').textContent = $('hneck').value + '°';
+  $('vhp').textContent = $('hpitch').value + '°';
+  $('vhy').textContent = $('hyaw').value + '°';
+  $('vhr').textContent = $('hroll').value + '°';
+  fetch('/ctl/head?neck=' + $('hneck').value + '&pitch=' + $('hpitch').value
+        + '&yaw=' + $('hyaw').value + '&roll=' + $('hroll').value).catch(() => {{}});
+}}
+headSliders.forEach(id => $(id).addEventListener('input', sendHead));
+$('headhome').onclick = () => {{
+  headSliders.forEach(id => $(id).value = 0);
+  sendHead();
+}};
 setInterval(() => {{ if (driving) send_cmd(); }}, 250);  // keep-alive heartbeat
 // The WASD compass loop. 150 ms ticks: aim from the freshest ground truth
 // (/status pos, updated at render rate), spin toward the screen direction
@@ -914,6 +950,32 @@ class Handler(BaseHTTPRequestHandler):
                 vx = vy = vyaw = 0.0
             with kbd_lock:
                 kbd_state.update(vx=vx, vy=vy, vyaw=vyaw, ts=time.time())
+            self._json({"ok": True})
+            return
+        if self.path.startswith("/ctl/head"):
+            # robot.head carries 4 head-joint deltas from the home pose,
+            # radians on the wire, degrees in the query. The clamps are the
+            # policy's trained sampling ranges (curriculum finals) — beyond
+            # them tracking is untrained, not stronger.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+
+            def delta(name, limit):
+                try:
+                    deg = float(q.get(name, ["0"])[0])
+                except ValueError:
+                    deg = 0.0
+                return max(-limit, min(limit, math.radians(deg)))
+
+            params = {"neck_pitch": delta("neck", 1.1),
+                      "head_pitch": delta("pitch", 1.1),
+                      "head_yaw": delta("yaw", 1.4),
+                      "head_roll": delta("roll", 0.31)}
+            try:
+                duck_rpc({"jsonrpc": "2.0", "method": "robot.head", "params": params})
+            except OSError as error:
+                print(f"planview: head failed: {error}", flush=True)
+                self._json({"ok": False})
+                return
             self._json({"ok": True})
             return
         if self.path.startswith("/ctl/skill"):
