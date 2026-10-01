@@ -22,6 +22,8 @@ STATE="$HOME/.cache/duck-sim"
 RL="$HOME/Pollen/microduck_rl"
 REPO="$HOME/aix1/taishan/microduck"
 BRIDGE="$REPO/scripts/board-bridge"
+# which scene the body loads — override per launch: DUCK_SIM_SCENE=/path/to/scene.xml
+SCENE="${DUCK_SIM_SCENE:-$STATE/scene_home/scene_home.xml}"
 
 say() { printf '\033[36m==\033[0m %s\n' "$*"; }
 
@@ -52,7 +54,7 @@ say "start MuJoCo body on :7801 (SIT keyframe)"
 cd "$RL"
 nohup .venv/bin/python -m mjlab_microduck.sim.body_server \
     --port 7801 --ducks 1 --keyframe SIT --headless \
-    --scene "$STATE/scene_home/scene_home.xml" \
+    --scene "$SCENE" \
     >> "$STATE/body.log" 2>&1 </dev/null &
 
 say "start MITM tap (:7802) and tunnel watchdog"
@@ -67,7 +69,7 @@ for _ in $(seq 1 30); do
 done
 [ -S "$STATE/duck-a.sock" ] || { say "tunnel socket never appeared — planview skipped"; }
 cd "$REPO"
-DUCK_SIM_SCENE="$STATE/scene_home/scene_home.xml" DUCK_SIM_REPO="$REPO" \
+DUCK_SIM_SCENE="$SCENE" DUCK_SIM_REPO="$REPO" \
     scripts/duck-sim planview
 
 say "start board brain"
