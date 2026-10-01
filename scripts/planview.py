@@ -655,7 +655,7 @@ PAGE = """<!doctype html>
   <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算，近景按斜视）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>摇头/点头：2 s 周期正弦摆动（摇头 ±40°、点头 ±25°），可同开；再按一次停，动滑杆全停<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
-<main><img src="/stream?follow={follow}"></main>
+<main><img id="cam" src="/stream?follow={follow}"></main>
 <script>
 const $ = id => document.getElementById(id);
 async function refresh() {{
@@ -724,13 +724,20 @@ $('brain').onclick = async () => {{
 // brain turns off gracefully (the duck walks home, no mid-stride freeze) —
 // and the gate then cuts the link on its own schedule. Coming back re-arms
 // the gate; the brain stays off until the 🧠 button is pressed.
+// Hidden tabs also keep the MJPEG connection alive — and the 12 fps render
+// it fuels — so hiding drops the stream here (viewers falls to 0 and the
+// mirror loop idles at 0.5 s); showing restores it.
 const beat = () => fetch('/ctl/heartbeat', {{method: 'POST'}}).catch(() => {{}});
 const bye = () => navigator.sendBeacon && navigator.sendBeacon('/ctl/bye');
+const cam = $('cam');
+const CAM_URL = cam.src;
+const CAM_BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 document.addEventListener('visibilitychange', () => {{
-  if (document.visibilityState === 'visible') beat(); else bye();
+  if (document.visibilityState === 'visible') {{ cam.src = CAM_URL; beat(); }}
+  else {{ cam.src = CAM_BLANK; bye(); }}
 }});
 addEventListener('pagehide', bye);
-setInterval(() => {{ if (document.visibilityState === 'visible') beat(); }}, 20000);
+setInterval(() => {{ if (document.visibilityState === 'visible') beat(); }}, 10000);
 beat();
 document.querySelectorAll('[data-skill]').forEach(b => {{
   b.onclick = async () => {{
@@ -1145,7 +1152,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(501)
 
     def _gate(self, beat: bool):
-        # beat=True is the page's 20 s keep-alive; beat=False asks the gate's
+        # beat=True is the page's 10 s keep-alive; beat=False asks the gate's
         # state. The body server's gate arms on the first beat and hangs the
         # board up when the beats stop — see HEARTBEAT_TIMEOUT_S there.
         try:
