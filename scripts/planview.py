@@ -13,9 +13,10 @@ plain python's CGL offscreen context drops world geoms and moves objects
 between frames. Verified 2026-09-27 with calibration spheres at known world
 positions; azimuth 90 is the map convention (+x right, +y up).
 
-Camera modes: by default the view is pinned to the world origin. Open
-http://localhost:8910/?follow=1 and the camera eases onto the duck
-(?follow=0 eases back to the origin). The yellow home disc is a 2D overlay,
+Camera modes: the default view is the locked 仙剑一-style oblique, eased
+onto the duck (user preference, 2026-10-01); the page buttons or
+`?follow=0` / `/stream?follow=0` switch to the origin-pinned top view and
+`?follow=1` back. The yellow home disc is a 2D overlay,
 so it stays correct in both modes.
 
 Endpoints: `/` serves a small control page — sidebar buttons for every
@@ -80,7 +81,7 @@ that render + JPEG encode is essentially all of this process's CPU.
 
 Deliberately a client of the public `read` op rather than a patch to
 body_server: the simulator's loop is untouched, and the only cost is one
-offscreen 640x640 render per frame in this process. The yellow home disc shows
+offscreen 960x600 render per frame in this process. The yellow home disc shows
 up because the scene XML is the same one the sim loaded (pass DUCK_SIM_SCENE
 through if it is not in the environment).
 
@@ -118,7 +119,8 @@ SCENE = os.environ.get(
 )
 HTTP_PORT = int(os.environ.get("DUCK_SIM_PLANVIEW_PORT", "8910"))
 FPS = 12
-SIZE = 640
+WIDTH = 960   # wide landscape — matches a browser window better than a square
+HEIGHT = 600
 
 # This file lives in the sim's state dir, next to the duck's IPC sockets.
 STATE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -162,8 +164,8 @@ def init_gl() -> None:
     model = mujoco.MjModel.from_xml_path(SCENE)
     # The renderer caps at the model's offscreen framebuffer; the stock
     # scenes ship the 640x480 default.
-    model.vis.global_.offwidth = SIZE
-    model.vis.global_.offheight = SIZE
+    model.vis.global_.offwidth = WIDTH
+    model.vis.global_.offheight = HEIGHT
     data = mujoco.MjData(model)
 
     trunk_joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
@@ -196,25 +198,26 @@ def init_gl() -> None:
     camera.azimuth = 90.0
     camera.distance = 2.2
 
-    renderer = mujoco.Renderer(model, height=SIZE, width=SIZE)
+    renderer = mujoco.Renderer(model, height=HEIGHT, width=WIDTH)
     gl_ready.set()
 
 frame_lock = threading.Lock()
 latest_jpeg = None
 viewers = 0  # connected MJPEG clients; the mirror renders only for these
 
-# Camera modes. The default frame is pinned to the world origin; `?follow=1`
-# in the stream URL eases the camera's lookat onto the duck instead (and back
-# to the origin with `?follow=0`). A per-tab choice would be nicer, but one
-# global flag keeps the mirror trivial — the last connected viewer wins.
-follow_duck = False
+# Camera modes. The default frame follows the duck (user preference,
+# 2026-10-01); `?follow=0` in the stream URL pins the camera to the world
+# origin instead (`?follow=1` — or no flag — follows). A per-tab choice
+# would be nicer, but one global flag keeps the mirror trivial — the last
+# connected viewer wins.
+follow_duck = True
 lookat_xy = [0.0, 0.0]
 FOLLOW_EASE = 0.15  # per frame at FPS — ~0.5 s time constant
-# Second locked view: the diagonal oblique (yaw 45°, pitched down ~50° in
-# the 仙剑一 style — steeper than the 35.264° true isometric), same
-# orthographic projection, rotation locked like the top view. follow_duck
-# still chooses what the lookat tracks.
-iso_view = False
+# oblique view (default since 2026-10-01, user preference): the diagonal
+# (yaw 45°, pitched down ~50° in the 仙剑一 style — steeper than the
+# 35.264° true isometric), same orthographic projection, rotation locked
+# like the top view. follow_duck still chooses what the lookat tracks.
+iso_view = True
 
 # Rendering on/off, global like the camera mode (one renderer, last viewer
 # wins). Paused: the mirror loop idles and the last JPEG keeps being served.
@@ -407,15 +410,15 @@ def render_frame(reading: dict) -> None:
     # # Projection: world +x is screen right, +y is screen up; the offscreen
     # # ortho camera covers ORTHO_FACTOR*distance metres vertically, so a
     # # world point p lands at
-    # #   (SIZE/2 + (px - lx) * s, SIZE/2 - (py - ly) * s),  s = SIZE / extent.
+    # #   (WIDTH/2 + (px - lx) * s, HEIGHT/2 - (py - ly) * s),  s = WIDTH / extent.
     # extent_m = ORTHO_FACTOR * camera.distance
-    # s = SIZE / extent_m
+    # s = WIDTH / extent_m
     # overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     # from PIL import ImageDraw
     # draw = ImageDraw.Draw(overlay)
     # r = 0.2 * s
-    # cx = SIZE / 2 - lookat_xy[0] * s
-    # cy = SIZE / 2 + lookat_xy[1] * s
+    # cx = WIDTH / 2 - lookat_xy[0] * s
+    # cy = HEIGHT / 2 + lookat_xy[1] * s
     # # Alpha 110 over the light checker cells read as "not rendered" — go
     # # nearly opaque and ring it so it survives both checker colours.
     # draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 200, 0, 190),
@@ -473,11 +476,11 @@ def mirror_loop() -> None:
 def banner(line1: str, line2: str) -> None:
     """A black frame with white text; pure PIL, no GL needed."""
     global latest_jpeg
-    img = Image.new("RGB", (SIZE, SIZE), (12, 12, 18))
+    img = Image.new("RGB", (WIDTH, HEIGHT), (12, 12, 18))
     from PIL import ImageDraw
     draw = ImageDraw.Draw(img)
-    draw.text((SIZE // 2 - 220, SIZE // 2 - 20), line1, fill=(255, 220, 80))
-    draw.text((SIZE // 2 - 200, SIZE // 2 + 20), line2, fill=(200, 200, 200))
+    draw.text((WIDTH // 2 - 220, HEIGHT // 2 - 20), line1, fill=(255, 220, 80))
+    draw.text((WIDTH // 2 - 200, HEIGHT // 2 + 20), line2, fill=(200, 200, 200))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=82)
     with frame_lock:
@@ -548,7 +551,7 @@ PAGE = """<!doctype html>
 <aside>
   <button id="pause">…</button>
   <button id="follow">…</button>
-  <button id="view">切到：斜视</button>
+  <button id="view">切到：俯视</button>
   <button id="drive">前进 3 秒</button>
   <button id="sit">坐下 / 站起</button>
   <button id="brain">🧠 大脑 on</button>
@@ -777,9 +780,9 @@ setInterval(refresh, 1000);
 
 
 def follow_from_path(path: str) -> bool:
-    return "follow=0" not in path and (
-        "follow=1" in path or "follow/" in path or path.endswith("follow")
-    )
+    # Follow is the default; ?follow=0 opts out (covers both the page URL,
+    # whose flag is passed through to the embedded stream, and /stream).
+    return "follow=0" not in path
 
 
 class Handler(BaseHTTPRequestHandler):
