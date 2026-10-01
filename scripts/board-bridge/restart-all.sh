@@ -52,6 +52,9 @@ adb forward tcp:2222 tcp:22
 
 say "start MuJoCo body on :7801 (SIT keyframe)"
 cd "$RL"
+# 30 s gate against the page's 10 s beats — 3 missed beats starve it, half
+# the body server's 60 s default (DUCK_SIM_HEARTBEAT_TIMEOUT_S, 0 disables).
+DUCK_SIM_HEARTBEAT_TIMEOUT_S="${DUCK_SIM_HEARTBEAT_TIMEOUT_S:-30}" \
 nohup .venv/bin/python -m mjlab_microduck.sim.body_server \
     --port 7801 --ducks 1 --keyframe SIT --headless \
     --scene "$SCENE" \
