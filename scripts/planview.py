@@ -21,9 +21,9 @@ so it stays correct in both modes.
 
 Endpoints: `/` serves a small control page — sidebar buttons for every
 control that already exists (pause/resume rendering, camera follow on/off,
-walk forward 3 s, sit/stand toggle, walk home, the one-shot skills, health),
-plus IJKL keyboard drive and a yaw slider; the stream fills the viewport
-beside them, no scrolling.
+view: top/oblique/close-up, walk forward 3 s, sit/stand toggle, walk home,
+the one-shot skills, health), plus IJKL keyboard drive and a yaw slider; the
+stream fills the viewport beside them, no scrolling.
 `/stream` is the MJPEG feed (the follow flag lives here); `/toggle` flips
 rendering on and off; `/status` reports state as JSON, including the duck's
 OWN pose estimate (a 2 Hz `robot.subscribe` thread) beside the ground truth
@@ -234,6 +234,19 @@ FOLLOW_EASE = 0.15  # per frame at FPS — ~0.5 s time constant
 # like the top view. follow_duck still chooses what the lookat tracks.
 iso_view = True
 
+# Close-up (2026-10-01): the same locked oblique pose with the camera pulled
+# in so the whole duck fills the frame. Orthographic, so distance IS the
+# zoom: the frame covers 0.828*distance metres vertically, 0.37 m at 0.45 —
+# the standing duck is ~0.28 m and fills ~65% of the frame height. The
+# lookat must lift off the floor for it: with lookat z = 0 the frame centers
+# on the ground point and the head clips at the top. While on it forces the
+# oblique pose regardless of iso_view (a top-down close-up reads as "the
+# duck's back", not a portrait); the WASD screen-compass mapping on the page
+# treats it as oblique for the same reason.
+closeup = False
+CLOSEUP_DISTANCE = 0.45
+CLOSEUP_LOOKAT_Z = 0.13
+
 # Rendering on/off, global like the camera mode (one renderer, last viewer
 # wins). Paused: the mirror loop idles and the last JPEG keeps being served.
 paused = False
@@ -437,12 +450,19 @@ def render_frame(reading: dict) -> None:
     camera.lookat[0] = lookat_xy[0]
     camera.lookat[1] = lookat_xy[1]
 
-    # Both views are rotation-locked fixed poses; only the lookat eases.
-    # The oblique view is pitched to -50 (negative-from-above in MuJoCo) —
+    # All views are rotation-locked fixed poses; only the lookat eases. The
+    # oblique view is pitched to -50 (negative-from-above in MuJoCo) —
     # chosen from a 35.264/45/50/55 sweep to match 仙剑一's high diagonal
     # look while keeping the duck reading as three-dimensional.
-    camera.azimuth, camera.elevation = (
-        (45.0, -50.0) if iso_view else (90.0, -90.0))
+    if closeup:
+        camera.azimuth, camera.elevation = 45.0, -50.0
+        camera.distance = CLOSEUP_DISTANCE
+        camera.lookat[2] = CLOSEUP_LOOKAT_Z
+    else:
+        camera.azimuth, camera.elevation = (
+            (45.0, -50.0) if iso_view else (90.0, -90.0))
+        camera.distance = 2.2
+        camera.lookat[2] = 0.0
 
     renderer.update_scene(data, camera=camera)
     rgb = renderer.render()
@@ -599,6 +619,7 @@ PAGE = """<!doctype html>
   <button id="pause">…</button>
   <button id="follow">…</button>
   <button id="view">切到：俯视</button>
+  <button id="closeup">切到：近景</button>
   <button id="drive">前进 3 秒</button>
   <button id="sit">坐下 / 站起</button>
   <button id="brain">🧠 大脑 on</button>
@@ -631,7 +652,7 @@ PAGE = """<!doctype html>
     </div>
     <button id="headhome">头部归位</button>
   </div>
-  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>摇头/点头：2 s 周期正弦摆动（摇头 ±40°、点头 ±25°），可同开；再按一次停，动滑杆全停<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
+  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算，近景按斜视）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>摇头/点头：2 s 周期正弦摆动（摇头 ±40°、点头 ±25°），可同开；再按一次停，动滑杆全停<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
 <main><img src="/stream?follow={follow}"></main>
@@ -641,13 +662,14 @@ async function refresh() {{
   let r;
   try {{ r = await (await fetch('/status')).json(); }}
   catch (e) {{ $('st').textContent = 'server gone'; return; }}
-  viewIso = !!r.iso;
+  viewIso = !!r.iso || !!r.closeup;            // close-up holds the oblique pose
   $('pause').textContent = r.paused ? '▶ 继续渲染' : '⏸ 暂停渲染';
   $('follow').textContent = r.follow ? '切到：定点' : '切到：跟随';
   $('view').textContent = r.iso ? '切到：俯视' : '切到：斜视';
+  $('closeup').textContent = r.closeup ? '切到：全景' : '切到：近景';
   let s = r.paused ? '已暂停（省 CPU）' : '渲染中 ' + r.fps + ' fps';
   s += '\\n相机：' + (r.follow ? '跟随鸭子' : '原点固定')
-       + ' · ' + (r.iso ? '斜视' : '俯视');
+       + ' · ' + (r.closeup ? '近景特写' : (r.iso ? '斜视' : '俯视'));
   if (r.pos) {{
     s += '\\n位置 (' + r.pos[0].toFixed(2) + ', ' + r.pos[1].toFixed(2) + ') m';
     s += '\\n朝向 ' + r.pos[2].toFixed(0) + '°';
@@ -684,6 +706,10 @@ $('follow').onclick = async () => {{
 $('view').onclick = async () => {{
   const iso = $('view').textContent.includes('斜视');
   await fetch('/ctl/view?iso=' + (iso ? '1' : '0')); refresh();
+}};
+$('closeup').onclick = async () => {{
+  const on = $('closeup').textContent.includes('近景');
+  await fetch('/ctl/closeup?on=' + (on ? '1' : '0')); refresh();
 }};
 $('drive').onclick = async () => {{ await fetch('/ctl/drive'); }};
 $('sit').onclick = async () => {{ await fetch('/ctl/sit'); }};
@@ -939,7 +965,7 @@ def follow_from_path(path: str) -> bool:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global follow_duck, paused, iso_view, swing_axes
+        global follow_duck, paused, iso_view, closeup, swing_axes
         if self.path.startswith("/status"):
             with odom_lock:
                 odom = list(odom_pose) if odom_pose is not None else None
@@ -949,6 +975,7 @@ class Handler(BaseHTTPRequestHandler):
                 swing = sorted(swing_axes)
             self._json({"paused": paused, "fps": FPS, "frames": frame_count,
                         "follow": follow_duck, "iso": iso_view,
+                        "closeup": closeup,
                         "pos": last_pose, "odom": odom,
                         "brain": brain, "brain_age": brain_age, "loop_hz": hz,
                         "gate": self._gate(beat=False), "viewers": viewers,
@@ -973,6 +1000,12 @@ class Handler(BaseHTTPRequestHandler):
             iso_view = q.get("iso", ["0"])[0] == "1"
             print(f"planview: view {'isometric' if iso_view else 'top-down'} (page button)", flush=True)
             self._json({"iso": iso_view})
+            return
+        if self.path.startswith("/ctl/closeup"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            closeup = q.get("on", ["0"])[0] == "1"
+            print(f"planview: view {'close-up' if closeup else 'wide'} (page button)", flush=True)
+            self._json({"closeup": closeup})
             return
         if self.path.startswith("/ctl/drive"):
             threading.Thread(target=drive_leg, daemon=True).start()
