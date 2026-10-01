@@ -40,6 +40,15 @@ servo position; [Where the servos are](#where-the-servos-are) explains.
 (`hip_l_2` and friends are a CAD-export naming artifact, not a sixth limb
 part; each leg is 129.0 g.)
 
+The trunk decomposes — by inference, not measurement, since the inertials
+are lumped — as roughly **2 servos (36 g) + battery (~119 g) + shells, board
+and bearings (~45 g)**. The battery is a real part in the CAD: an `np_f970`
+mesh of 52 cm³ inside `trunk_base`, and 52 cm³ at LiPo pack density is
+~119 g, which is exactly what the trunk needs after the servos. What the
+sim does *not* carry is the battery's electrical side — voltage and
+temperature are constants there (see
+[What it is and is not a twin of](../design/simulation.md#7-what-it-is-and-is-not-a-twin-of)).
+
 The distribution is the interesting part: **head and neck carry ~38% of the
 mass, the trunk 27%, the legs 35%.** A top-heavy bird — when it falls, it
 falls on its head, which is exactly why the velstand training prices
