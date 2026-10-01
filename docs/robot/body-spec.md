@@ -72,16 +72,18 @@ children's joints — the trunk hosts the hip-yaw pair, the upper leg the hip
 pitch and the knee, the shank the ankle, the neck the two pitch servos, the
 head shell the roll servo and the mouth.
 
-Mass is where the model is honest about being a model. The `xl330` mesh is
-true to size (15.7 cm³ envelope, against the real servo's 34 × 22.4 × 22 mm
-box), but the left shank masses **21.6 g all-in while housing a whole
-XL330** — a real one weighs 23–24 g. The export's inertials therefore leave
-most of the servo mass out. The sim's **737.2 g** is what every policy
-trains against; fifteen real XL330s are another ~345 g (the manifest's
-`robot.servos="xl330"`), so a built duck outweighs its model by roughly
-that. Densities in the mass table read against servo-shaped holes: the
-envelope counts each servo mesh, the mass mostly does not. The sim drives
-14 of the 15; the mouth is present as geometry only.
+Mass: the servos are *in* the numbers. The export folds each servo's mass
+into its mounting link — no servo bodies — at close to the real thing. The
+`xl330` mesh is true to size (15.7 cm³ envelope against the real
+20 × 34 × 25 mm box), a real XL330-M077-T weighs **18 g**, and at 18 g per
+servo the bodies close almost exactly: the neck is 36.8 g around two servos
+plus a collar, the shank 21.6 g around one plus its shell. Against the
+**~800 g** the RL repository's README quotes for the built bird
+(`robot.servos="xl330"` names the model), the sim's **737.2 g** leaves a gap
+of a few percent — cables, fasteners, rounding — the same order as the ±5%
+mass randomization training applies. The sim is not quietly carrying a
+lighter duck than the hardware. The sim drives 14 of the 15; the mouth is
+present as geometry only.
 
 ## Joints and servos: 14, not 15
 
@@ -230,6 +232,6 @@ print(Counter(m.body(int(m.geom_bodyid[g])).name for g in range(m.ngeom)
 Per-part masses are `m.body_mass[i]` per body; the standing span is the max
 and min world z over every duck geom's rotated `geom_aabb` corners (skip
 `geom_bodyid == 0`, or the infinite floor swallows the answer). Read the
-densities as a rough check, not a signal: the envelope counts servo-shaped
-volume the inertials mostly don't weigh — the placement list above is the
-ground truth for where the servos are.
+densities as a rough check, not a signal: hollow shells read low even with
+their servos counted — the placement list above is the ground truth for
+where the servos are.
