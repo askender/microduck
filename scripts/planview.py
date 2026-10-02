@@ -19,6 +19,13 @@ onto the duck (user preference, 2026-10-01); the page buttons or
 `?follow=1` back. The yellow home disc is a 2D overlay,
 so it stays correct in both modes.
 
+Minimap: a compass disc over the stream's top-right corner shows the four
+cardinals, the duck's on-screen heading, and the bearing/distance home.
+It is drawn client-side from `/status`'s ground-truth pose; the cardinals
+rotate with the view, since screen-up's world bearing is 45° in the oblique
+views and 0° top-down (measured 2026-10-02, /tmp/compass_cal2.py: iso is
+N up-left / E up-right / S down-right / W down-left).
+
 Endpoints: `/` serves a small control page — sidebar buttons for every
 control that already exists (pause/resume rendering, camera follow on/off,
 view: top/oblique/close-up, walk forward 3 s, sit/stand toggle, walk home,
@@ -599,7 +606,8 @@ PAGE = """<!doctype html>
           flex-direction: column; gap: 8px; border-right: 1px solid #333;
           box-sizing: border-box; overflow-y: auto; }}
   main {{ flex: 1; min-width: 0; display: flex; align-items: center;
-          justify-content: center; }}
+          justify-content: center; position: relative; }}
+  #map {{ position: absolute; top: 10px; right: 10px; pointer-events: none; }}
   img {{ max-width: 100%; max-height: 100vh; object-fit: contain; }}
   button {{ font: inherit; padding: 6px 0; cursor: pointer; width: 100%; }}
   .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
@@ -655,9 +663,56 @@ PAGE = """<!doctype html>
   <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算，近景按斜视）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>摇头/点头：2 s 周期正弦摆动（摇头 ±40°、点头 ±25°），可同开；再按一次停，动滑杆全停<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
   <div id="st"></div>
 </aside>
-<main><img id="cam" src="/stream?follow={follow}"></main>
+<main><img id="cam" src="/stream?follow={follow}"><canvas id="map" width="130" height="130"></canvas></main>
 <script>
 const $ = id => document.getElementById(id);
+// Minimap compass (top-right disc): cardinal ring rotates with the camera
+// view; the yellow house sits on the home bearing, the blue triangle is the
+// duck's on-screen heading, the number is the distance home. Bearings are
+// compass deg (N=0, E=90, clockwise); screen-up's world bearing is 45° in
+// the oblique views, 0° top-down (measured 2026-10-02, /tmp/compass_cal2.py).
+function drawMap(r) {{
+  const g = $('map').getContext('2d');
+  const cx = 65, cy = 65, R = 52;
+  const cam = (r.iso || r.closeup) ? 45 : 0;
+  g.clearRect(0, 0, 130, 130);
+  g.beginPath(); g.arc(cx, cy, R + 11, 0, 6.3);
+  g.fillStyle = 'rgba(8,10,14,.7)'; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,.22)'; g.stroke();
+  const pt = b => {{ const t = (b - cam) * Math.PI / 180;
+                    return [cx + R * Math.sin(t), cy - R * Math.cos(t)]; }};
+  g.font = 'bold 13px system-ui';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (const pair of [['北', 0], ['东', 90], ['南', 180], ['西', 270]]) {{
+    const p = pt(pair[1]);
+    g.fillStyle = pair[1] === 0 ? '#ffd800' : '#ddd';
+    g.fillText(pair[0], p[0], p[1]);
+  }}
+  if (!r.pos && !r.odom) {{
+    g.fillStyle = '#888'; g.font = '11px ui-monospace';
+    g.fillText('no fix', cx, cy);
+    return;
+  }}
+  const p = r.pos || r.odom;   // ground truth, else the board's own odometry
+  const dist = Math.hypot(p[0], p[1]);
+  if (dist > 0.05) {{                       // otherwise home is under the duck
+    const t = (Math.atan2(-p[0], -p[1]) * 180 / Math.PI - cam)
+              * Math.PI / 180;               // duck -> home, on screen
+    const hx = cx + (R - 20) * Math.sin(t), hy = cy - (R - 20) * Math.cos(t);
+    g.fillStyle = '#ffd800';                 // little house, kept upright
+    g.fillRect(hx - 4, hy - 1, 8, 6);
+    g.beginPath(); g.moveTo(hx - 6, hy - 1); g.lineTo(hx, hy - 7);
+    g.lineTo(hx + 6, hy - 1); g.closePath(); g.fill();
+  }}
+  const dt = (90 - p[2] - cam) * Math.PI / 180;   // yaw 0 = east, on screen
+  g.save(); g.translate(cx, cy); g.rotate(dt);
+  g.fillStyle = '#4da3ff';
+  g.beginPath(); g.moveTo(0, -9); g.lineTo(6, 7); g.lineTo(0, 3);
+  g.lineTo(-6, 7); g.closePath(); g.fill();
+  g.restore();
+  g.fillStyle = '#ffd800'; g.font = '10px ui-monospace';
+  g.fillText(dist.toFixed(2) + 'm', cx, cy + 20);
+}}
 async function refresh() {{
   let r;
   try {{ r = await (await fetch('/status')).json(); }}
@@ -696,6 +751,7 @@ async function refresh() {{
   }}
   swinging = new Set(r.swing || []);             // resync after a page reload
   swingUI();
+  drawMap(r);
   $('st').textContent = s;
 }}
 $('pause').onclick = async () => {{ await fetch('/toggle'); refresh(); }};
