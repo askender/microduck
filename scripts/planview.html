@@ -1,0 +1,421 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>duck plan view</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ccc;
+                font: 14px system-ui; overflow: hidden; }
+  body { display: flex; }
+  aside { width: 200px; min-width: 200px; padding: 10px; display: flex;
+          flex-direction: column; gap: 8px; border-right: 1px solid #333;
+          box-sizing: border-box; overflow-y: auto; }
+  main { flex: 1; min-width: 0; display: flex; align-items: center;
+          justify-content: center; position: relative; }
+  #map { position: absolute; top: 10px; right: 10px; pointer-events: none; }
+  img { max-width: 100%; max-height: 100vh; object-fit: contain; }
+  button { font: inherit; padding: 6px 0; cursor: pointer; width: 100%; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  #healthbox { display: none; font: 11px/1.5 ui-monospace, monospace;
+               color: #9d9; background: #181818; padding: 8px;
+               border-radius: 4px; white-space: pre-wrap; max-height: 40vh;
+               overflow-y: auto; }
+  .yaw label { font-size: 12px; color: #bbb; }
+  .yaw input { width: 100%; }
+  .yawv { color: #ffd800; }
+  #hint { font-size: 12px; color: #888; line-height: 1.7; }
+  #st { margin-top: auto; font-size: 12px; color: #999;
+         white-space: pre-line; line-height: 1.6; }
+</style></head>
+<body>
+<aside>
+  <button id="pause">…</button>
+  <button id="follow">…</button>
+  <button id="view">切到：俯视</button>
+  <button id="closeup">切到：近景</button>
+  <button id="drive">前进 3 秒</button>
+  <button id="sit">坐下 / 站起</button>
+  <button id="brain">🧠 大脑 on</button>
+  <div class="grid2">
+    <button data-skill="kick_left">左踢</button>
+    <button data-skill="kick_right">右踢</button>
+    <button data-skill="roulade">翻滚</button>
+    <button data-skill="ground_pick">捡起</button>
+  </div>
+  <button id="home">回家</button>
+  <button id="health">健康检查</button>
+  <pre id="healthbox"></pre>
+  <div class="yaw">
+    <label>转向 vyaw <span class="yawv" id="yawv">0.0</span></label>
+    <input id="yaw" type="range" min="-2" max="2" step="0.1" value="0">
+  </div>
+  <div class="yaw">
+    <label>头部（°，0 = 归位姿态；正俯仰 = 低头）</label>
+    <label>颈俯仰 <span class="yawv" id="vneck">0°</span></label>
+    <input id="hneck" type="range" min="-63" max="63" step="1" value="0">
+    <label>头俯仰 <span class="yawv" id="vhp">0°</span></label>
+    <input id="hpitch" type="range" min="-63" max="63" step="1" value="0">
+    <label>头偏转 <span class="yawv" id="vhy">0°</span></label>
+    <input id="hyaw" type="range" min="-80" max="80" step="1" value="0">
+    <label>头侧倾 <span class="yawv" id="vhr">0°</span></label>
+    <input id="hroll" type="range" min="-18" max="18" step="1" value="0">
+    <div class="grid2">
+      <button id="swingy">摇头</button>
+      <button id="swingp">点头</button>
+    </div>
+    <button id="headhome">头部归位</button>
+  </div>
+  <div id="hint">键盘（先点一下页面）<br>I 前进 <span class="yawv" id="cruisev">0.50</span> · K 后退 <span class="yawv" id="revv">0.80</span><br>↑/↓ 调速（<span id="cruiserange"></span>；按住 K 调后退）<br>J/L 原地转向（Shift 精细 ~10°）<br>I+J 行进转弯 · U/O 方向盘渐增回正<br>WASD 走向屏幕 上/左/下/右（先转向对准再前进；随俯视/斜视自动换算，近景按斜视）<br>X 直线补偿 <span class="yawv" id="strv">开</span>（按速度抵消右偏，转向时自动让位）<br>头部滑杆：0 = 归位姿态，正俯仰 = 低头；策略追踪（走路时也有效），非舵机直写<br>摇头/点头：2 s 周期正弦摆动（摇头 ±40°、点头 ±25°），可同开；再按一次停，动滑杆全停<br>切走或关闭页面：自动停车（先大脑 off，后断链）</div>
+  <div id="st"></div>
+</aside>
+<main><img id="cam" src="/stream?follow=__FOLLOW__"><canvas id="map" width="130" height="130"></canvas></main>
+<script>
+const $ = id => document.getElementById(id);
+// Minimap compass (top-right disc): cardinal ring rotates with the camera
+// view; the yellow house sits on the home bearing, the blue triangle is the
+// duck's on-screen heading, the number is the distance home. Bearings are
+// compass deg (N=0, E=90, clockwise); screen-up's world bearing is 45° in
+// the oblique views, 0° top-down (measured 2026-10-02, /tmp/compass_cal2.py).
+function drawMap(r) {
+  const g = $('map').getContext('2d');
+  const cx = 65, cy = 65, R = 52;
+  const cam = (r.iso || r.closeup) ? 45 : 0;
+  g.clearRect(0, 0, 130, 130);
+  g.beginPath(); g.arc(cx, cy, R + 11, 0, 6.3);
+  g.fillStyle = 'rgba(8,10,14,.7)'; g.fill();
+  g.strokeStyle = 'rgba(255,255,255,.22)'; g.stroke();
+  const pt = b => { const t = (b - cam) * Math.PI / 180;
+                    return [cx + R * Math.sin(t), cy - R * Math.cos(t)]; };
+  g.font = 'bold 13px system-ui';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (const pair of [['北', 0], ['东', 90], ['南', 180], ['西', 270]]) {
+    const p = pt(pair[1]);
+    g.fillStyle = pair[1] === 0 ? '#ffd800' : '#ddd';
+    g.fillText(pair[0], p[0], p[1]);
+  }
+  if (!r.pos && !r.odom) {
+    g.fillStyle = '#888'; g.font = '11px ui-monospace';
+    g.fillText('no fix', cx, cy);
+    return;
+  }
+  const p = r.pos || r.odom;   // ground truth, else the board's own odometry
+  const dist = Math.hypot(p[0], p[1]);
+  if (dist > 0.05) {                       // otherwise home is under the duck
+    const t = (Math.atan2(-p[0], -p[1]) * 180 / Math.PI - cam)
+              * Math.PI / 180;               // duck -> home, on screen
+    const hx = cx + (R - 20) * Math.sin(t), hy = cy - (R - 20) * Math.cos(t);
+    g.fillStyle = '#ffd800';                 // little house, kept upright
+    g.fillRect(hx - 4, hy - 1, 8, 6);
+    g.beginPath(); g.moveTo(hx - 6, hy - 1); g.lineTo(hx, hy - 7);
+    g.lineTo(hx + 6, hy - 1); g.closePath(); g.fill();
+  }
+  const dt = (90 - p[2] - cam) * Math.PI / 180;   // yaw 0 = east, on screen
+  g.save(); g.translate(cx, cy); g.rotate(dt);
+  g.fillStyle = '#4da3ff';
+  g.beginPath(); g.moveTo(0, -9); g.lineTo(6, 7); g.lineTo(0, 3);
+  g.lineTo(-6, 7); g.closePath(); g.fill();
+  g.restore();
+  g.fillStyle = '#ffd800'; g.font = '10px ui-monospace';
+  g.fillText(dist.toFixed(2) + 'm', cx, cy + 20);
+}
+async function refresh() {
+  let r;
+  try { r = await (await fetch('/status')).json(); }
+  catch (e) { $('st').textContent = 'server gone'; return; }
+  viewIso = !!r.iso || !!r.closeup;            // close-up holds the oblique pose
+  $('pause').textContent = r.paused ? '▶ 继续渲染' : '⏸ 暂停渲染';
+  $('follow').textContent = r.follow ? '切到：定点' : '切到：跟随';
+  $('view').textContent = r.iso ? '切到：俯视' : '切到：斜视';
+  $('closeup').textContent = r.closeup ? '切到：全景' : '切到：近景';
+  let s = r.paused ? '已暂停（省 CPU）' : '渲染中 ' + r.fps + ' fps';
+  s += '\\n相机：' + (r.follow ? '跟随鸭子' : '原点固定')
+       + ' · ' + (r.closeup ? '近景特写' : (r.iso ? '斜视' : '俯视'));
+  if (r.pos) {
+    s += '\\n位置 (' + r.pos[0].toFixed(2) + ', ' + r.pos[1].toFixed(2) + ') m';
+    s += '\\n朝向 ' + r.pos[2].toFixed(0) + '°';
+  }
+  if (r.odom && r.pos) {
+    s += '\\n里程 (' + r.odom[0].toFixed(2) + ', ' + r.odom[1].toFixed(2) + ') '
+         + r.odom[2].toFixed(0) + '°';
+    s += '\\n里程误差 ' + Math.hypot(r.odom[0] - r.pos[0],
+                                     r.odom[1] - r.pos[1]).toFixed(2) + ' m';
+  }
+  if (r.brain != null) {
+    if (r.brain_age > 5) {
+      s += '\\n🧠 无流（板子离线?）';
+    } else {
+      const on = r.brain !== 'held';
+      s += '\\n🧠 大脑 ' + (on ? '开 (' + r.brain + ')' : '关 (held)');
+      $('brain').textContent = '🧠 大脑 ' + (on ? 'on' : 'off');
+    }
+  }
+  if (r.gate && r.gate.ok) {
+    if (!r.gate.armed) s += '\\n心跳 未上膛（页面开着就喂养）';
+    else if (r.gate.starved) s += '\\n心跳 断供中 — 板子已停车';
+    else s += '\\n心跳 喂养中（' + Math.max(0, Math.round(r.gate.timeout_s - r.gate.age_s)) + 's 后停车）';
+  }
+  swinging = new Set(r.swing || []);             // resync after a page reload
+  swingUI();
+  drawMap(r);
+  $('st').textContent = s;
+}
+$('pause').onclick = async () => { await fetch('/toggle'); refresh(); };
+$('follow').onclick = async () => {
+  const on = $('follow').textContent.includes('跟随');
+  await fetch('/ctl/follow?on=' + (on ? '1' : '0')); refresh();
+};
+$('view').onclick = async () => {
+  const iso = $('view').textContent.includes('斜视');
+  await fetch('/ctl/view?iso=' + (iso ? '1' : '0')); refresh();
+};
+$('closeup').onclick = async () => {
+  const on = $('closeup').textContent.includes('近景');
+  await fetch('/ctl/closeup?on=' + (on ? '1' : '0')); refresh();
+};
+$('drive').onclick = async () => { await fetch('/ctl/drive'); };
+$('sit').onclick = async () => { await fetch('/ctl/sit'); };
+$('brain').onclick = async () => {
+  const turning_on = $('brain').textContent.includes('off');
+  const r = await (await fetch('/ctl/brain?on=' + (turning_on ? '1' : '0'))).json();
+  if (!r.ok) { alert(r.msg || 'robot.enable failed'); return; }
+  $('brain').textContent = '🧠 大脑 ' + (turning_on ? 'on' : 'off');
+};
+// The body server parks the board when nobody watches. Beats go only while
+// this tab is visible; hiding or closing it first sends a farewell — the
+// brain turns off gracefully (the duck walks home, no mid-stride freeze) —
+// and the gate then cuts the link on its own schedule. Coming back re-arms
+// the gate; the brain stays off until the 🧠 button is pressed.
+// Hidden tabs also keep the MJPEG connection alive — and the 12 fps render
+// it fuels — so hiding drops the stream here (viewers falls to 0 and the
+// mirror loop idles at 0.5 s); showing restores it.
+const beat = () => fetch('/ctl/heartbeat', {method: 'POST'}).catch(() => {});
+const bye = () => navigator.sendBeacon && navigator.sendBeacon('/ctl/bye');
+const cam = $('cam');
+const CAM_URL = cam.src;
+const CAM_BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') { cam.src = CAM_URL; beat(); }
+  else { cam.src = CAM_BLANK; bye(); }
+});
+addEventListener('pagehide', bye);
+setInterval(() => { if (document.visibilityState === 'visible') beat(); }, 10000);
+beat();
+document.querySelectorAll('[data-skill]').forEach(b => {
+  b.onclick = async () => {
+    b.disabled = true;
+    const r = await (await fetch('/ctl/skill?name=' + b.dataset.skill)).json();
+    if (!r.ok) { alert(r.msg); b.disabled = false; return; }
+    setTimeout(() => b.disabled = false, 5000);  // one-shots run 1-3 s
+  };
+});
+$('health').onclick = async () => {
+  const box = $('healthbox');
+  if (box.style.display === 'block') { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  box.textContent = '…';
+  box.textContent = (await (await fetch('/ctl/health')).json()).text;
+};
+$('home').onclick = async () => {
+  const r = await (await fetch('/ctl/home')).json();
+  if (r.ok) {
+    $('home').disabled = true;
+    setTimeout(() => $('home').disabled = false, 60000);
+  } else { alert(r.msg); }
+};
+// IJKL + U/O steering wheel + yaw slider: report what is held; the server
+// retransmits at 10 Hz and stops 0.7 s after updates go quiet (robotd's own
+// deadman is 500 ms). J/L spin in place (vyaw ±2, ~60 deg/s measured); held
+// with I/K they become forward/backward arcs. U/O ramp the shared steer
+// value up like a steering wheel and spring it back on release; the slider
+// is a hand on the same wheel.
+const keys = { i: 0, k: 0, j: 0, l: 0, u: 0, o: 0 };
+// WASD compass drive: walk toward SCREEN up/left/down/right — turn to face
+// the screen direction first, then cruise forward. IJKL above are body-frame
+// (tank controls); these are world-frame, recomputed per view: the camera
+// azimuth is 90 deg in the top view (screen up = world +y) and 45 deg in the
+// oblique (screen up = the +x+y diagonal), so screen up = az deg, right =
+// az-90, down = az+180, left = az+90 in world yaw. viewIso is refreshed from
+// /status every second.
+const dirKeys = { w: 0, a: 0, s: 0, d: 0 };
+let lastDir = null;                             // most recent WASD press
+let viewIso = true;
+const yaw = $('yaw');
+let steer = 0;                                  // the one vyaw source
+let shift = false;                              // Shift+J/L = fine taps
+let cruise = 0.5;                               // the vx W sends (Up/Down)
+let rev = 0.8;                                  // |vx| S sends (Up/Down while S held)
+const CRUISE_MIN = 0.3, CRUISE_MAX = 1.2, CRUISE_STEP = 0.05;
+const REV_MIN = 0.4, REV_MAX = 1.2;
+// 直线 compensation: the counter-vyaw that cancels the v5 policy's
+// speed-dependent rightward arc (measured 2026-09-30, /tmp/straight_*.py +
+// comp_high.py). Anchors at every second 0.05 step, linear between; covers
+// the whole forward cruise range [0.3, 1.2]. Forward only.
+let straight = true;                            // X toggles
+const COMP = [
+  [0.3, 0.18], [0.35, 0.2], [0.4, 0.22], [0.45, 0.33], [0.5, 0.44],
+  [0.55, 0.37], [0.6, 0.3], [0.65, 0.35], [0.7, 0.4], [0.75, 0.33],
+  [0.8, 0.25], [0.85, 0.3], [0.9, 0.35], [0.95, 0.35], [1.0, 0.35],
+  [1.05, 0.28], [1.1, 0.2], [1.15, 0.15], [1.2, 0.1]];
+function comp(v) {
+  if (v < COMP[0][0]) return 0;
+  for (let i = 0; i < COMP.length - 1; i++) {
+    const a = COMP[i], b = COMP[i + 1];
+    if (v <= b[0]) return a[1] + (b[1] - a[1]) * (v - a[0]) / (b[0] - a[0]);
+  }
+  return COMP[COMP.length - 1][1];
+}
+const STEER_MAX = 2.0, STEER_RATE = 0.25;       // per 100 ms — lock in 0.8 s
+const wheeling = () => keys.u || keys.o || Math.abs(steer) > 0.01;
+function held_cmd() {
+  let vx = 0;
+  if (keys.i) vx += cruise;
+  if (keys.k) vx -= rev;
+  let vyaw = steer;
+  const lock = shift ? 1.5 : 2.0;               // fine lock ~10 deg/tap
+  if (!wheeling()) {
+    if (keys.j && !keys.l) vyaw = lock;
+    if (keys.l && !keys.j) vyaw = -lock;
+  }
+  // Straight compensation only when nothing else steers — J/L, U/O and the
+  // slider stay pure manual input.
+  if (straight && keys.i && !keys.k && vyaw === 0) vyaw = comp(cruise);
+  return { vx, vy: 0, vyaw };
+}
+let driving = false;
+function send_cmd() {
+  const c = held_cmd();
+  driving = (c.vx !== 0 || c.vyaw !== 0);
+  fetch('/ctl/keys?vx=' + c.vx + '&vy=' + c.vy + '&vyaw=' + c.vyaw).catch(() => {});
+}
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'shift') { shift = true; send_cmd(); return; }
+  if (k === 'x' && !e.repeat) {
+    straight = !straight;
+    $('strv').textContent = straight ? '开' : '关';
+    send_cmd();
+    return;
+  }
+  if (k === 'arrowup' || k === 'arrowdown') {
+    // cruise control: adjust whichever direction is held — the forward cruise
+    // (W) normally, the reverse cruise (S) while S alone is held.
+    const d = k === 'arrowup' ? CRUISE_STEP : -CRUISE_STEP;
+    if (keys.k && !keys.i) {
+      rev = Math.min(REV_MAX, Math.max(REV_MIN, rev + d));
+      $('revv').textContent = rev.toFixed(2);
+    } else {
+      cruise = Math.min(CRUISE_MAX, Math.max(CRUISE_MIN, cruise + d));
+      $('cruisev').textContent = cruise.toFixed(2);
+    }
+    e.preventDefault(); send_cmd();
+    return;
+  }
+  if (k in dirKeys) { dirKeys[k] = 1; lastDir = k; e.preventDefault(); return; }
+  if (k in keys) { keys[k] = 1; e.preventDefault(); send_cmd(); }
+});
+document.addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'shift') { shift = false; send_cmd(); return; }
+  if (k in dirKeys) {
+    dirKeys[k] = 0;
+    if (lastDir === k) lastDir = ['w', 'a', 's', 'd'].find(x => dirKeys[x]) || null;
+    if (!lastDir) fetch('/ctl/keys?vx=0&vy=0&vyaw=0').catch(() => {});
+    return;
+  }
+  if (k in keys) { keys[k] = 0; send_cmd(); }
+});
+setInterval(() => {                            // the wheel itself
+  if (keys.u && !keys.o) steer = Math.min(STEER_MAX, steer + STEER_RATE);
+  else if (keys.o && !keys.u) steer = Math.max(-STEER_MAX, steer - STEER_RATE);
+  else if (steer > 0) steer = Math.max(0, steer - 4 * STEER_RATE);
+  else if (steer < 0) steer = Math.min(0, steer + 4 * STEER_RATE);
+  if (keys.u || keys.o || steer !== 0) {
+    yaw.value = steer;                          // slider mirrors the wheel
+    $('yawv').textContent = steer.toFixed(1);
+    send_cmd();
+  }
+}, 100);
+yaw.addEventListener('input', () => {          // a hand on the wheel directly
+  steer = parseFloat(yaw.value);
+  $('yawv').textContent = steer.toFixed(1);
+  send_cmd();
+});
+yaw.addEventListener('change', () => {         // released: spring back to zero
+  steer = 0;
+  yaw.value = 0;
+  $('yawv').textContent = '0.0';
+  send_cmd();
+});
+
+// Head sliders: degrees, 0 = home pose. robot.head has no deadman, so one
+// fetch per input event holds; the server clamps to the trained deltas.
+const headSliders = ['hneck', 'hpitch', 'hyaw', 'hroll'];
+function sendHead() {
+  $('vneck').textContent = $('hneck').value + '°';
+  $('vhp').textContent = $('hpitch').value + '°';
+  $('vhy').textContent = $('hyaw').value + '°';
+  $('vhr').textContent = $('hroll').value + '°';
+  fetch('/ctl/head?neck=' + $('hneck').value + '&pitch=' + $('hpitch').value
+        + '&yaw=' + $('hyaw').value + '&roll=' + $('hroll').value).catch(() => {});
+}
+headSliders.forEach(id => $(id).addEventListener('input', sendHead));
+$('headhome').onclick = () => {
+  headSliders.forEach(id => $(id).value = 0);
+  if (swinging) setSwing(null); else sendHead();
+};
+
+// 摇头/点头: the server traces the sines (both axes may run at once); the
+// buttons toggle independently. Moving any slider stops both
+// (setSwing(null) re-sends the slider pose).
+let swinging = new Set();
+function swingUI() {
+  $('swingy').textContent = swinging.has('yaw') ? '摇头：开' : '摇头';
+  $('swingp').textContent = swinging.has('pitch') ? '点头：开' : '点头';
+}
+async function setSwing(axis) {
+  await fetch('/ctl/headswing?axis=' + (axis || 'off')).catch(() => {});
+  if (axis) {
+    if (swinging.has(axis)) swinging.delete(axis); else swinging.add(axis);
+  } else swinging.clear();
+  swingUI();
+  if (!swinging.size) sendHead();
+}
+$('swingy').onclick = () => setSwing('yaw');
+$('swingp').onclick = () => setSwing('pitch');
+headSliders.forEach(id => $(id).addEventListener('input', () => {
+  if (swinging.size) setSwing(null);
+}));
+setInterval(() => { if (driving) send_cmd(); }, 250);  // keep-alive heartbeat
+// The WASD compass loop. 150 ms ticks: aim from the freshest ground truth
+// (/status pos, updated at render rate), spin toward the screen direction
+// past 15 deg of error, then cruise with a proportional heading hold
+// (walking small-vyaw gain is ~40 deg/s per 1.0). Holding two of WASD+IJKL
+// at once lets the two emitters interleave — last writer wins per tick.
+let compassBusy = false;
+setInterval(async () => {
+  const az = viewIso ? 45 : 90;
+  const offs = { w: 0, a: 90, s: 180, d: -90 };
+  const held = lastDir && dirKeys[lastDir] ? lastDir
+             : ['w', 'a', 's', 'd'].find(x => dirKeys[x]);
+  if (!held || compassBusy) return;
+  compassBusy = true;
+  try {
+    const r = await (await fetch('/status')).json();
+    if (!r.pos) return;                       // no ground truth — cannot aim
+    const err = ((az + offs[held] - r.pos[2]) % 360 + 540) % 360 - 180;
+    let vx = 0, vyaw = 0;
+    if (Math.abs(err) > 15) {
+      vyaw = err > 0 ? 2.0 : -2.0;            // spin toward the direction
+    } else {
+      vx = cruise;                            // walk it, holding heading
+      // comp() pre-cancels the gait's rightward arc so err*0.06 is purely
+      // corrective (without it the hold fights the arc and holds ~13 deg).
+      vyaw = Math.max(-2, Math.min(2, comp(cruise) + err * 0.06));
+    }
+    fetch('/ctl/keys?vx=' + vx + '&vy=0&vyaw=' + vyaw).catch(() => {});
+  } catch (e) {}
+  finally { compassBusy = false; }
+}, 150);
+$('cruiserange').textContent = '前进 ' + CRUISE_MIN.toFixed(2) + '–' + CRUISE_MAX.toFixed(2)
+  + ' / 后退 ' + REV_MIN.toFixed(2) + '–' + REV_MAX.toFixed(2);
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body></html>

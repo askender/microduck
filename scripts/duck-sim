@@ -921,6 +921,12 @@ PY
 # repo version back.
 install_client() {
     [ "$STATE/$1.py" -nt "$REPO/scripts/$1.py" ] || cp "$REPO/scripts/$1.py" "$STATE/$1.py"
+    # Sibling files (e.g. planview.html) — copy if present and stale.
+    for ext in html; do
+        [ -f "$REPO/scripts/$1.$ext" ] &&
+            { [ ! "$STATE/$1.$ext" -nt "$REPO/scripts/$1.$ext" ] && cp "$REPO/scripts/$1.$ext" "$STATE/$1.$ext"; }
+    done
+    true
 }
 
 # ── wandering ─────────────────────────────────────────────────────────────
