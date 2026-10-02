@@ -30,6 +30,7 @@
   <button id="follow">…</button>
   <button id="view">切到：俯视</button>
   <button id="closeup">切到：近景</button>
+  <button id="cog" style="display:none">重心：关</button>
   <button id="drive">前进 3 秒</button>
   <button id="sit">坐下 / 站起</button>
   <button id="brain">🧠 大脑 on</button>
@@ -124,6 +125,7 @@ async function refresh() {
   $('follow').textContent = r.follow ? '切到：定点' : '切到：跟随';
   $('view').textContent = r.iso ? '切到：俯视' : '切到：斜视';
   $('closeup').textContent = r.closeup ? '切到：全景' : '切到：近景';
+  $('cog').textContent = '重心：' + (r.cog ? '开' : '关');
   let s = r.paused ? '已暂停（省 CPU）' : '渲染中 ' + r.fps + ' fps';
   s += '\\n相机：' + (r.follow ? '跟随鸭子' : '原点固定')
        + ' · ' + (r.closeup ? '近景特写' : (r.iso ? '斜视' : '俯视'));
@@ -168,6 +170,10 @@ $('view').onclick = async () => {
 $('closeup').onclick = async () => {
   const on = $('closeup').textContent.includes('近景');
   await fetch('/ctl/closeup?on=' + (on ? '1' : '0')); refresh();
+};
+$('cog').onclick = async () => {
+  const r = await (await fetch('/ctl/cog')).json();
+  $('cog').textContent = '重心：' + (r.cog ? '开' : '关');
 };
 $('drive').onclick = async () => { await fetch('/ctl/drive'); };
 $('sit').onclick = async () => { await fetch('/ctl/sit'); };

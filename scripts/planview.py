@@ -172,7 +172,10 @@ renderer = None
 camera = None
 trunk_qpos = 0
 joint_qpos = []
+foot_body_ids = (0, 0)  # (left, right) — set in init_gl
+trunk_body_id = 0
 gl_ready = threading.Event()
+show_cog = False
 
 
 def init_gl() -> None:
@@ -182,7 +185,7 @@ def init_gl() -> None:
     must happen on ONE thread. Module level only parses arguments; the model,
     renderer and every render live in mirror_loop's thread.
     """
-    global model, data, renderer, camera, trunk_qpos, joint_qpos
+    global model, data, renderer, camera, trunk_qpos, joint_qpos, foot_body_ids, trunk_body_id
     model = mujoco.MjModel.from_xml_path(SCENE)
     # The renderer caps at the model's offscreen framebuffer; the stock
     # scenes ship the 640x480 default.
@@ -221,6 +224,11 @@ def init_gl() -> None:
     camera.distance = 2.2
 
     renderer = mujoco.Renderer(model, height=HEIGHT, width=WIDTH)
+    trunk_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
+    foot_body_ids = (
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "ankle_left"),
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "ankle_right"),
+    )
     gl_ready.set()
 
 frame_lock = threading.Lock()
@@ -440,6 +448,71 @@ def ctl_health() -> str:
         return f"health failed: {error}"
 
 
+def _world_to_pixel(point, az_deg, el_deg, dist, lx, ly, lz):
+    """Project a 3D world point to pixel coordinates under the ortho camera."""
+    az = math.radians(az_deg)
+    el = math.radians(el_deg)
+    sa, ca = math.sin(az), math.cos(az)
+    se, ce = math.sin(el), math.cos(el)
+    right = (sa, -ca, 0.0)
+    fwd = (ce * sa, ce * ca, se)
+    up = (right[1] * fwd[2] - right[2] * fwd[1],
+          right[2] * fwd[0] - right[0] * fwd[2],
+          right[0] * fwd[1] - right[1] * fwd[0])
+    extent = ORTHO_FACTOR * dist
+    s = WIDTH / extent
+    dx = point[0] - lx
+    dy = point[1] - ly
+    dz = point[2] - lz
+    sx = dx * right[0] + dy * right[1]
+    sy = dx * up[0] + dy * up[1] + dz * up[2]
+    return (WIDTH / 2 + sx * s, HEIGHT / 2 - sy * s)
+
+
+def _draw_cog_overlay(img) -> Image.Image:
+    """Draw CoG dot + support base on the rendered frame."""
+    from PIL import ImageDraw
+    com = data.subtree_com[trunk_body_id]
+    lf = data.xpos[foot_body_ids[0]]
+    rf = data.xpos[foot_body_ids[1]]
+
+    az = camera.azimuth
+    el = camera.elevation
+    dist = camera.distance
+    lx, ly, lz = camera.lookat[0], camera.lookat[1], camera.lookat[2]
+
+    com_ground = (com[0], com[1], 0.0)
+    lf_ground = (lf[0], lf[1], 0.0)
+    rf_ground = (rf[0], rf[1], 0.0)
+    com_px = _world_to_pixel(com_ground, az, el, dist, lx, ly, lz)
+    lf_px = _world_to_pixel(lf_ground, az, el, dist, lx, ly, lz)
+    rf_px = _world_to_pixel(rf_ground, az, el, dist, lx, ly, lz)
+
+    draw = ImageDraw.Draw(img)
+
+    draw.line([lf_px, rf_px], fill=(100, 200, 255), width=2)
+    fr = 4
+    draw.ellipse([lf_px[0] - fr, lf_px[1] - fr, lf_px[0] + fr, lf_px[1] + fr],
+                 fill=(100, 200, 255))
+    draw.ellipse([rf_px[0] - fr, rf_px[1] - fr, rf_px[0] + fr, rf_px[1] + fr],
+                 fill=(100, 200, 255))
+
+    mid_x = (lf_px[0] + rf_px[0]) / 2
+    mid_y = (lf_px[1] + rf_px[1]) / 2
+    dx = com_px[0] - mid_x
+    dy = com_px[1] - mid_y
+    half_base = math.hypot(lf_px[0] - rf_px[0], lf_px[1] - rf_px[1]) / 2
+    margin = half_base * 0.8 if half_base > 0 else 10
+    inside = math.hypot(dx, dy) < margin
+    color = (0, 255, 100) if inside else (255, 60, 60)
+
+    cr = 6
+    draw.ellipse([com_px[0] - cr, com_px[1] - cr, com_px[0] + cr, com_px[1] + cr],
+                 fill=color, outline=(255, 255, 255), width=1)
+
+    return img
+
+
 def render_frame(reading: dict) -> None:
     global latest_jpeg, frame_count, last_pose
     data.qpos[trunk_qpos : trunk_qpos + 3] = reading["trunk"]
@@ -474,6 +547,8 @@ def render_frame(reading: dict) -> None:
     renderer.update_scene(data, camera=camera)
     rgb = renderer.render()
     img = Image.fromarray(rgb)
+    if show_cog:
+        img = _draw_cog_overlay(img)
     # --- Home-disc 2D overlay: TEMPORARILY DISABLED 2026-09-28 — the user
     # --- wants only the world geom (the GL-rendered home_disc) for now.
     # --- Re-enable by uncommenting the block below.
@@ -609,7 +684,7 @@ def follow_from_path(path: str) -> bool:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global follow_duck, paused, iso_view, closeup, swing_axes
+        global follow_duck, paused, iso_view, closeup, swing_axes, show_cog
         if self.path.startswith("/status"):
             with odom_lock:
                 odom = list(odom_pose) if odom_pose is not None else None
@@ -619,7 +694,7 @@ class Handler(BaseHTTPRequestHandler):
                 swing = sorted(swing_axes)
             self._json({"paused": paused, "fps": FPS, "frames": frame_count,
                         "follow": follow_duck, "iso": iso_view,
-                        "closeup": closeup,
+                        "closeup": closeup, "cog": show_cog,
                         "pos": last_pose, "odom": odom,
                         "brain": brain, "brain_age": brain_age, "loop_hz": hz,
                         "gate": self._gate(beat=False), "viewers": viewers,
@@ -650,6 +725,11 @@ class Handler(BaseHTTPRequestHandler):
             closeup = q.get("on", ["0"])[0] == "1"
             print(f"planview: view {'close-up' if closeup else 'wide'} (page button)", flush=True)
             self._json({"closeup": closeup})
+            return
+        if self.path.startswith("/ctl/cog"):
+            show_cog = not show_cog
+            print(f"planview: cog overlay {'on' if show_cog else 'off'}", flush=True)
+            self._json({"cog": show_cog})
             return
         if self.path.startswith("/ctl/drive"):
             threading.Thread(target=drive_leg, daemon=True).start()
